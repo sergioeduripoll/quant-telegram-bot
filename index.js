@@ -4,7 +4,7 @@ const cron = require('node-cron');
 const axios = require('axios');
 const express = require('express');
 
-// === SERVIDOR PARA RENDER (Keep-Alive) ===
+// === SERVIDOR PARA RENDER ===
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('🚀 Quant Sniper V12.5 ELITE Online'));
@@ -15,22 +15,19 @@ const token = process.env.TELEGRAM_TOKEN;
 const chatId = process.env.CHAT_ID;
 const geminiApiKey = process.env.GEMINI_API_KEY;
 
-// Inicializamos el Bot con Polling Reforzado
+// Polling más lento (2 seg) para evitar el error 409 Conflict
 const bot = new TelegramBot(token, { 
     polling: {
-        interval: 300,
+        interval: 2000,
         autoStart: true,
         params: { timeout: 10 }
     } 
 });
 
-// Limpieza de Webhooks (Asegura que el bot escuche siempre)
-bot.deleteWebHook()
-    .then(() => console.log('🧹 Webhook antiguo eliminado. Polling activo.'))
-    .catch((err) => console.log('⚠️ Error limpiando Webhook:', err.message));
+// Limpieza automática al arrancar
+bot.deleteWebHook().then(() => console.log('🧹 Webhook limpio.'));
 
 const CONFIG = {
-    BE: 54.94,
     BINANCE_API: 'https://api.binance.com/api/v3',
     BACKEND_URL: 'https://quant-backend-lhue.onrender.com/api',
     PROB_THRESHOLD: 58,
@@ -38,12 +35,10 @@ const CONFIG = {
     MARKETS: [
         { id: 'BTC/USD', symbolBinance: 'BTCUSDT' }, 
         { id: 'ETH/USD', symbolBinance: 'ETHUSDT' },
-        { id: 'ADA/USD', symbolBinance: 'ADAUSDT' }, 
-        { id: 'LTC/USD', symbolBinance: 'LTCUSDT' }, 
         { id: 'SOL/USD', symbolBinance: 'SOLUSDT' },
-        { id: 'XRP/USD', symbolBinance: 'XRPUSDT' },
-        { id: 'DOGE/USD', symbolBinance: 'DOGEUSDT' },
-        { id: 'BNB/USD', symbolBinance: 'BNBUSDT' }
+        { id: 'BNB/USD', symbolBinance: 'BNBUSDT' },
+        { id: 'ADA/USD', symbolBinance: 'ADAUSDT' },
+        { id: 'XRP/USD', symbolBinance: 'XRPUSDT' }
     ]
 };
 
@@ -52,7 +47,7 @@ let signalCounter = 0;
 
 console.log('🤖 Motor Quant Sniper V12.5 ELITE Iniciado...');
 
-// === LÓGICA MATEMÁTICA ===
+// === LÓGICA DE ANÁLISIS CUANTITATIVO ===
 
 function precalcATR(candles, period = 14) {
     if (!candles || candles.length < period + 1) return new Array(candles ? candles.length : 0).fill(0);
@@ -76,8 +71,7 @@ function buildPatternVector(candles, atrs, endIndex) {
     for (let k = endIndex - CONFIG.PATTERN_LENGTH + 1; k <= endIndex; k++) {
         if (k < 5 || !candles[k] || !candles[k-1]) continue; 
         const c = candles[k];
-        const currentATR = atrs[k] || 1;
-        vec.push(c.c - c.o, c.h - c.l, c.c > c.o ? 1 : -1, currentATR, c.c - candles[k-1].c);
+        vec.push(c.c - c.o, c.h - c.l, c.c > c.o ? 1 : -1, atrs[k] || 1, c.c - candles[k-1].c);
     }
     return vec;
 }
@@ -89,7 +83,7 @@ function runAnalysisElite(candles) {
     if (targetVector.length === 0) return null;
 
     let matches = [];
-    const startIdx = Math.max(40, candles.length - 10000);
+    const startIdx = Math.max(40, candles.length - 8000);
 
     for (let i = startIdx; i < candles.length - 10; i++) {
         const histVector = buildPatternVector(candles, atrs, i);
@@ -103,9 +97,9 @@ function runAnalysisElite(candles) {
         matches.push({ dist, win: (candles[i + 1].c > candles[i].c) ? 1 : 0 });
     }
 
-    if (matches.length < 15) return null;
+    if (matches.length < 12) return null;
     matches.sort((a,b) => a.dist - b.dist);
-    const top = matches.slice(0, 30);
+    const top = matches.slice(0, 25);
     const wins = top.reduce((acc, m) => acc + m.win, 0);
     const prob = (wins / top.length) * 100;
     
@@ -117,20 +111,30 @@ function runAnalysisElite(candles) {
 
 // === ESCANEO GLOBAL ===
 async function globalScan() {
-    console.log(`[${new Date().toLocaleTimeString()}] 🚀 Escaneando mercados...`);
+    console.log(`[${new Date().toLocaleTimeString()}] 🚀 Iniciando Escaneo Global...`);
     
     for (const asset of CONFIG.MARKETS) {
         try {
+            // 1. Obtener velas del Backend (IP de Render suele funcionar aquí)
             const res = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=5000`, { timeout: 15000 });
             const candles = res.data;
             if (!Array.isArray(candles)) continue;
 
-            const lobRes = await axios.get(`${CONFIG.BINANCE_API}/depth?symbol=${asset.symbolBinance}&limit=20`);
-            let bV=0, aV=0;
-            lobRes.data.bids.forEach(l => bV += parseFloat(l[0]) * parseFloat(l[1]));
-            lobRes.data.asks.forEach(l => aV += parseFloat(l[0]) * parseFloat(l[1]));
-            const obi = (bV - aV) / (bV + aV);
+            // 2. Obtener Order Book de Binance (Con bypass para error 451)
+            let obi = 0;
+            try {
+                const lobRes = await axios.get(`${CONFIG.BINANCE_API}/depth?symbol=${asset.symbolBinance}&limit=20`);
+                let bV=0, aV=0;
+                lobRes.data.bids.forEach(l => bV += parseFloat(l[0]) * parseFloat(l[1]));
+                lobRes.data.asks.forEach(l => aV += parseFloat(l[0]) * parseFloat(l[1]));
+                obi = (bV - aV) / (bV + aV);
+            } catch (binanceErr) {
+                // Si Binance bloquea la IP, seguimos sin el OBI para que el bot no se detenga
+                obi = 0; 
+                console.log(`⚠️ Binance 451 en ${asset.id} (IP Restringida), continuando sin LOB.`);
+            }
 
+            // 3. Ejecutar Análisis
             const result = runAnalysisElite(candles);
             
             if (result && result.prob >= CONFIG.PROB_THRESHOLD) {
@@ -138,7 +142,7 @@ async function globalScan() {
                 SIGNAL_CACHE.set(sigId, { asset, result, obi });
 
                 const icon = result.direction === 'BUY' ? '🟢' : '🔴';
-                const msg = `${icon} *${asset.id} | 5M*\n*PROB:* ${result.prob.toFixed(1)}%\n*DIR:* ${result.direction}\n*LOB:* ${obi.toFixed(3)}`;
+                const msg = `${icon} *${asset.id} | 5M*\n*PROB:* ${result.prob.toFixed(1)}%\n*DIR:* ${result.direction}\n*LOB:* ${obi === 0 ? 'N/A' : obi.toFixed(3)}`;
                 
                 bot.sendMessage(chatId, msg, {
                     parse_mode: 'Markdown',
@@ -151,39 +155,37 @@ async function globalScan() {
     }
 }
 
-// === IA GEMINI ===
+// === INTERACCIÓN CON IA ===
 bot.on('callback_query', async (query) => {
     const data = SIGNAL_CACHE.get(query.data);
     if (!data) return;
 
-    bot.answerCallbackQuery(query.id, { text: 'Gemini analizando...' });
+    bot.answerCallbackQuery(query.id, { text: 'Gemini analizando mercado...' });
 
-    const prompt = `Analiza trading binarias: ${data.asset.id}. Direccion: ${data.result.direction}. Probabilidad: ${data.result.prob.toFixed(1)}%. LOB Imbalance: ${data.obi.toFixed(3)}. Responde corto: EXECUTE o PASS, confianza % y motivo.`;
+    const prompt = `Actúa como experto en trading. Analiza: ${data.asset.id}. Dir: ${data.result.direction}. Prob: ${data.result.prob.toFixed(1)}%. LOB: ${data.obi}. Responde MUY corto: EXECUTE o PASS y el por qué técnico.`;
 
     try {
         const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiApiKey}`;
         const res = await axios.post(url, { contents: [{ parts: [{ text: prompt }] }] });
-        bot.sendMessage(chatId, `🧠 *VERDICTO IA*\n\n${res.data.candidates[0].content.parts[0].text}`, { parse_mode: 'Markdown' });
+        bot.sendMessage(chatId, `🧠 *VERDICTO GEMINI IA*\n\n${res.data.candidates[0].content.parts[0].text}`, { parse_mode: 'Markdown' });
     } catch (e) {
-        bot.sendMessage(chatId, '❌ Error con Gemini.');
+        bot.sendMessage(chatId, '❌ Error: Gemini no pudo procesar el análisis.');
     }
 });
 
-// === COMANDOS Y CRON ===
-bot.onText(/\/scan/, () => {
-    console.log("📥 Comando /scan recibido");
-    globalScan();
-});
+// === COMANDOS Y PROGRAMACIÓN ===
+bot.onText(/\/scan/, () => globalScan());
 
-// Mensaje de inicio para confirmar que escucha
-bot.sendMessage(chatId, "✅ *Quant Sniper V12.5 ELITE* ha iniciado y está escuchando.");
-
-// Cada 5 min (minuto 3:30)
+// Cron cada 5 minutos
 cron.schedule('30 3,8,13,18,23,28,33,38,43,48,53,58 * * * *', () => globalScan());
 
-// Auto-despertador (Ping cada 10 min)
+// Keep-alive cada 10 min
 cron.schedule('*/10 * * * *', async () => {
     try { await axios.get('https://quant-telegram-bot.onrender.com/'); } catch (e) {}
 });
 
-bot.on('polling_error', (err) => console.log('⚠️ Error Polling:', err.message));
+bot.on('polling_error', (err) => {
+    if(!err.message.includes('409')) console.log('⚠️ Polling:', err.message);
+});
+
+console.log('✅ Sistema cargado. Esperando comandos...');
