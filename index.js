@@ -4,10 +4,9 @@ const cron = require('node-cron');
 const axios = require('axios');
 const express = require('express');
 
-// === SERVIDOR PARA RENDER ===
+// === SERVIDOR PARA RENDER (Keep-Alive) ===
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 app.get('/', (req, res) => res.send('🚀 Quant Sniper V12.5 ELITE Online'));
 app.listen(PORT, () => console.log(`📡 Servidor HTTP activo en puerto ${PORT}`));
 
@@ -16,13 +15,24 @@ const token = process.env.TELEGRAM_TOKEN;
 const chatId = process.env.CHAT_ID;
 const geminiApiKey = process.env.GEMINI_API_KEY;
 
-// Inicializamos el Bot
-const bot = new TelegramBot(token, { polling: true });
+// Inicializamos el Bot con Polling Reforzado
+const bot = new TelegramBot(token, { 
+    polling: {
+        interval: 300,
+        autoStart: true,
+        params: { timeout: 10 }
+    } 
+});
+
+// Limpieza de Webhooks (Asegura que el bot escuche siempre)
+bot.deleteWebHook()
+    .then(() => console.log('🧹 Webhook antiguo eliminado. Polling activo.'))
+    .catch((err) => console.log('⚠️ Error limpiando Webhook:', err.message));
 
 const CONFIG = {
     BE: 54.94,
     BINANCE_API: 'https://api.binance.com/api/v3',
-    BACKEND_URL: 'https://quant-backend-lhue.onrender.com/api', // URL fija para evitar errores
+    BACKEND_URL: 'https://quant-backend-lhue.onrender.com/api',
     PROB_THRESHOLD: 58,
     PATTERN_LENGTH: 6,
     MARKETS: [
@@ -40,7 +50,7 @@ const CONFIG = {
 const SIGNAL_CACHE = new Map();
 let signalCounter = 0;
 
-console.log('🤖 Motor Quant Sniper V12.5 ELITE Iniciando...');
+console.log('🤖 Motor Quant Sniper V12.5 ELITE Iniciado...');
 
 // === LÓGICA MATEMÁTICA ===
 
@@ -111,19 +121,16 @@ async function globalScan() {
     
     for (const asset of CONFIG.MARKETS) {
         try {
-            // 1. Pedir velas al Backend
-            const res = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=5000`);
+            const res = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=5000`, { timeout: 15000 });
             const candles = res.data;
             if (!Array.isArray(candles)) continue;
 
-            // 2. Pedir LOB a Binance
             const lobRes = await axios.get(`${CONFIG.BINANCE_API}/depth?symbol=${asset.symbolBinance}&limit=20`);
             let bV=0, aV=0;
             lobRes.data.bids.forEach(l => bV += parseFloat(l[0]) * parseFloat(l[1]));
             lobRes.data.asks.forEach(l => aV += parseFloat(l[0]) * parseFloat(l[1]));
             const obi = (bV - aV) / (bV + aV);
 
-            // 3. Analizar
             const result = runAnalysisElite(candles);
             
             if (result && result.prob >= CONFIG.PROB_THRESHOLD) {
@@ -151,19 +158,25 @@ bot.on('callback_query', async (query) => {
 
     bot.answerCallbackQuery(query.id, { text: 'Gemini analizando...' });
 
-    const prompt = `Analiza para binarias: ${data.asset.id}. Dir: ${data.result.direction}. Prob: ${data.result.prob.toFixed(1)}%. LOB: ${data.obi.toFixed(3)}. Responde corto: EXECUTE o PASS y motivo.`;
+    const prompt = `Analiza trading binarias: ${data.asset.id}. Direccion: ${data.result.direction}. Probabilidad: ${data.result.prob.toFixed(1)}%. LOB Imbalance: ${data.obi.toFixed(3)}. Responde corto: EXECUTE o PASS, confianza % y motivo.`;
 
     try {
         const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiApiKey}`;
         const res = await axios.post(url, { contents: [{ parts: [{ text: prompt }] }] });
-        bot.sendMessage(chatId, `🧠 *IA VERDICT:*\n\n${res.data.candidates[0].content.parts[0].text}`, { parse_mode: 'Markdown' });
+        bot.sendMessage(chatId, `🧠 *VERDICTO IA*\n\n${res.data.candidates[0].content.parts[0].text}`, { parse_mode: 'Markdown' });
     } catch (e) {
         bot.sendMessage(chatId, '❌ Error con Gemini.');
     }
 });
 
 // === COMANDOS Y CRON ===
-bot.onText(/\/scan/, () => globalScan());
+bot.onText(/\/scan/, () => {
+    console.log("📥 Comando /scan recibido");
+    globalScan();
+});
+
+// Mensaje de inicio para confirmar que escucha
+bot.sendMessage(chatId, "✅ *Quant Sniper V12.5 ELITE* ha iniciado y está escuchando.");
 
 // Cada 5 min (minuto 3:30)
 cron.schedule('30 3,8,13,18,23,28,33,38,43,48,53,58 * * * *', () => globalScan());
@@ -173,4 +186,4 @@ cron.schedule('*/10 * * * *', async () => {
     try { await axios.get('https://quant-telegram-bot.onrender.com/'); } catch (e) {}
 });
 
-bot.on('polling_error', (err) => console.log('⚠️ Error Telegram Polling:', err.message));
+bot.on('polling_error', (err) => console.log('⚠️ Error Polling:', err.message));
