@@ -202,13 +202,15 @@ bot.on('callback_query', async (query) => {
     const data = query.data;
     if (!data.startsWith('analyze_')) return;
 
-    const sigId = data.split('_')[1];
+    // Corrección para no romper los IDs con guiones bajos múltiples (ej: sig_0)
+    const sigId = data.replace('analyze_', ''); 
     const s = SIGNAL_CACHE.get(sigId);
 
     if (!s) {
         return bot.answerCallbackQuery(query.id, { text: "⏳ La señal expiró o ya no está en caché.", show_alert: true });
     }
 
+    // Control para evitar doble ejecución de la IA en la misma señal
     if (s.aiProcessed) {
         return bot.answerCallbackQuery(query.id, {
             text: "⚠️ La IA ya fue ejecutada en esta señal.",
@@ -276,6 +278,7 @@ bot.on('callback_query', async (query) => {
         const updatedMsg = s.msgText.replace('⏳ _Esperando orden para análisis IA..._', `*Veredicto IA:* ${verdictIcon} (Score: ${iaScore}/100)\n*Contexto IA:* 🧩 ${iaContextText}\n_📝 ${iaReasoning}_${tradingModuleText}`);
         await bot.editMessageText(updatedMsg, { chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown' });
 
+        // Inyectamos los resultados de la IA en la auditoría pendiente
         const auditEntry = PENDING_AUDITS.find(a => a.sigId === sigId);
         if (auditEntry) {
             auditEntry.logData.iaVerdict = iaVerdictText;
@@ -284,7 +287,7 @@ bot.on('callback_query', async (query) => {
         }
 
     } catch (e) {
-        s.aiProcessed = false; // Permitir reintento en caso de error
+        s.aiProcessed = false; // Permitimos volver a tocar el botón si la API falló
         await bot.editMessageText(s.msgText.replace('⏳ _Esperando orden para análisis IA..._', '❌ _Fallo de conexión IA. Intenta de nuevo._'), { 
             chat_id: chatId, 
             message_id: query.message.message_id, 
@@ -840,13 +843,6 @@ Anticipación: ${antBar} (${anticipationLevel}%)
                 }
             });
             
-            logToCSV({
-                asset: s.assetId, tf: s.tf, dir: s.analysis.direction, prob: s.analysis.prob.toFixed(1),
-                lob: s.obi.toFixed(3), edge: s.analysis.edge.toFixed(2), alpha: s.analysis.acs.toFixed(3),
-                stab: (s.analysis.stability * 100).toFixed(0), cwev: s.analysis.cwev.toFixed(1),
-                samples: s.analysis.n, veredicto: 'PENDIENTE', iaVerdict: 'NO_SOLICITADO', iaScore: 0, iaContext: 'N/A', mode: modeString
-            });
-
             PENDING_AUDITS.push({
                 sigId, assetId: s.assetId, symbolBinance: s.symbolBinance, tf: s.tf, direction: s.analysis.direction,
                 startTs: timeData.startTs, endTs: timeData.endTs, messageId: sentMsg.message_id, retries: 0,
@@ -898,9 +894,7 @@ setInterval(async () => {
                 const isTie = closePrice === openPrice;
                 const iconResult = isTie ? 'EMPATE' : (isWin ? 'GANADA' : 'PERDIDA');
 
-                const auditMsg = `🔍 *AUDITORÍA FINAL (BINANCE)*\n\n*Activo:* ${audit.assetId}\n*Dirección:* ${audit.direction}\n*Modo:* ${audit.logData.mode}\n*Contexto IA:* ${audit.logData.iaContext}\n*Veredicto IA:* ${audit.logData.iaVerdict} (Score: ${audit.logData.iaScore})\n\n🟢 Open: ${openPrice.toFixed(4)}\n🔴 Close: ${closePrice.toFixed(4)}\n\n*Resultado:* ${iconResult}`;
-                await bot.sendMessage(chatId, auditMsg, { parse_mode: 'Markdown', reply_to_message_id: audit.messageId });
-                
+                // Aseguramos que se guarde el log ANTES del mensaje a Telegram por si la API falla
                 logToCSV({ 
                     asset: audit.assetId, tf: audit.tf, dir: audit.direction, 
                     prob: audit.logData.prob, lob: audit.logData.lob, edge: audit.logData.edge,
@@ -908,9 +902,15 @@ setInterval(async () => {
                     samples: audit.logData.samples, iaVerdict: audit.logData.iaVerdict, iaScore: audit.logData.iaScore, iaContext: audit.logData.iaContext, mode: audit.logData.mode,
                     veredicto: iconResult, open: openPrice, close: closePrice 
                 });
+
+                const auditMsg = `🔍 *AUDITORÍA FINAL (BINANCE)*\n\n*Activo:* ${audit.assetId}\n*Dirección:* ${audit.direction}\n*Modo:* ${audit.logData.mode}\n*Contexto IA:* ${audit.logData.iaContext}\n*Veredicto IA:* ${audit.logData.iaVerdict} (Score: ${audit.logData.iaScore})\n\n🟢 Open: ${openPrice.toFixed(4)}\n🔴 Close: ${closePrice.toFixed(4)}\n\n*Resultado:* ${iconResult}`;
+                await bot.sendMessage(chatId, auditMsg, { parse_mode: 'Markdown', reply_to_message_id: audit.messageId });
                 
                 PENDING_AUDITS.splice(i, 1);
-            } catch (error) { audit.retries++; }
+            } catch (error) { 
+                console.error("[SYS] Error procesando auditoría:", error.message);
+                audit.retries++; 
+            }
         }
     }
 }, 15000);
