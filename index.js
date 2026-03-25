@@ -309,30 +309,28 @@ function evaluateHiddenRisk(signal, profile) {
     // --- 2. MEMORIA A CORTO PLAZO VIVA (Live Learning) ---
     const liveState = liveLearningState[signal.assetId];
     if (liveState) {
-        // Ponderación extrema a la racha perdedora reciente en vivo
         if (liveState.lossStreak >= 3) {
-            riskScore += (liveState.lossStreak * 15); // Ej: 3 seguidas malas = +45 Riesgo (Casi bloqueo seguro)
+            riskScore += (liveState.lossStreak * 15); 
         } else if (liveState.lossStreak === 2) {
             riskScore += 20;
         }
 
-        // Evaluación del patrón específico de este trade en vivo
         const patKey = getPatternKey(signal.analysis.cwev, signal.analysis.acs, signal.analysis.edge, signal.tf, signal.obi, signal.momentumSlope);
         const recentPattern = liveState.patterns[patKey];
         
         if (recentPattern && recentPattern.total >= 2) {
             const patWR = recentPattern.wins / recentPattern.total;
             if (patWR < 0.40) {
-                riskScore += 30; // El bot acaba de perder operando algo muy parecido a esto
+                riskScore += 30; 
             } else if (patWR > 0.60) {
-                riskScore -= 15; // Patrón en racha ganadora, reducimos riesgo
+                riskScore -= 15; 
             }
         }
         
         if (liveState.totalTrades >= 5 && liveState.winRate < 0.45) riskScore += 20;
     }
 
-    return Math.max(0, Math.min(riskScore, 100)); // Cap entre 0 y 100
+    return Math.max(0, Math.min(riskScore, 100)); 
 }
 
 function applyAdaptiveFilter(signal) {
@@ -384,7 +382,7 @@ function getAssetLearningContext(assetId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// MÓDULO 2: SINCRONIZACIÓN Y LOGGING (Mantenido intacto)
+// MÓDULO 2: SINCRONIZACIÓN Y LOGGING
 // ═══════════════════════════════════════════════════════════════════
 
 let timeOffset = 0;
@@ -470,14 +468,8 @@ function getDynamicThreshold(atr, price) {
     return threshold;
 }
 
-function getDynamicSecond(volatility) {
-    if (volatility > 0.004) return 5;
-    if (volatility < 0.0015) return 35;
-    return 15;
-}
-
 // ═══════════════════════════════════════════════════════════════════
-// MÓDULO 4: MOTOR CUANTITATIVO (Mantenido intacto)
+// MÓDULO 4: MOTOR CUANTITATIVO
 // ═══════════════════════════════════════════════════════════════════
 
 function calculateZScore(values) {
@@ -813,7 +805,7 @@ async function globalScan(scanType = 'auto') {
             const baseTradeData = calculateTradeLevels(s.analysis.currentPrice, s.analysis.direction, s.analysis.currentATR, s.analysis.absEdge, "CONTINUATION", circuitBreakerLevel, s.analysis.stabilityRaw);
             let tradingText = "";
             if (baseTradeData) {
-                tradingText = `\n\n💰 *MODO TRADING (Spot/CFD x20)*\n📍 *Entry:* ${baseTradeData.entry} | 🛑 *SL:* ${baseTradeData.sl} | 🎯 *TP:* ${baseTradeData.tp}\n⚖️ *R:R:* 1:${baseTradeData.rr} | 💼 *Vol:* ${baseTradeData.positionSize} USDT | 📉 *Riesgo:* ${baseTradeData.riskPercent}%`;
+                tradingText = `\n\n💰 *MODO TRADING (Spot/CFD x20)*\n📍 *Entry:* ${baseTradeData.entry} | 🛑 *SL:* ${baseTradeData.sl} | 🎯 *TP:* ${baseTradeData.tp}\n⚖️ *R:R:* 1:${baseTradeData.rr} | 💼 *Volumen sugerido:* ${baseTradeData.positionSize} USDT | 📉 *Riesgo:* ${baseTradeData.riskPercent}%`;
             }
 
             // 🎯 TARJETA VISUAL LIMPIA
@@ -897,48 +889,14 @@ bot.on('callback_query', async (query) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// MÓDULO 7: CRONES DINÁMICOS (CON PRECISIÓN SNIPER Y ANTI-MISS)
+// MÓDULO 7: CRONES DE EJECUCIÓN Y AUDITORÍA
 // ═══════════════════════════════════════════════════════════════════
 
-let lastScanExecution = 0; // Control de disparo único
-
-setInterval(async () => { 
-    let volSum = 0, count = 0;
-
-    // Calculamos el pulso global del mercado con los datos en memoria
-    for (const candles of GLOBAL_CANDLE_CACHE.values()) {
-        const atrs = precalcATR(candles);
-        const atr = atrs[atrs.length - 1];
-        const price = candles[candles.length - 1].c;
-        if (atr && price) { 
-            volSum += atr / price; 
-            count++; 
-        }
-    }
-
-    const avgVol = count > 0 ? volSum / count : 0.002;
-    
-    // 🧠 Fallback inteligente: Si la caché está vacía al arrancar, apunta al segundo 15 seguro.
-    const targetSecond = count > 0 ? getDynamicSecond(avgVol) : 15;
-    
-    const now = new Date(getSyncedTime()); 
-    const minuteMatch = (now.getMinutes() % 5 === 3);
-    
-    // Ventana de 2 segundos para tolerar latencia del servidor
-    const secondWindow = Math.abs(now.getSeconds() - targetSecond) <= 2;
-
-    // 🚀 ANTI-DUPLICADO + ANTI-MISS
-    if (minuteMatch && secondWindow) {
-        const nowTs = Date.now();
-
-        // Evita que la ventana de 2 segundos dispare el scan 2 o 3 veces seguidas
-        if (nowTs - lastScanExecution > 10000) { 
-            lastScanExecution = nowTs;
-            console.log(`[SYS] 🚀 AUTO SCAN DISPARADO: ${now.toLocaleTimeString('es-AR')} (Target Sec: ${targetSecond})`);
-            globalScan('auto'); 
-        }
-    }
-}, 1000);
+// 🚀 MOTOR DE AUTOSCAN (Simple y Robusto)
+setInterval(() => {
+    console.log("🧠 AutoScan ejecutándose:", new Date(getSyncedTime()).toISOString());
+    globalScan('auto');
+}, 20000); // Se ejecuta cada 20 segundos. La lógica interna filtra el ruido.
 
 // 🚀 CRON DE AUDITORÍA Y APRENDIZAJE
 setInterval(async () => {
