@@ -95,11 +95,11 @@ function formatPrice(val) {
 }
 
 function calculateTradeLevels(price, direction, atr, edge, iaContext, cbLevel) {
-    const capital = 1000; // 👈 Tu capital en USD configurado aquí
-    const leverage = 20;  // 👈 Apalancamiento máximo usado
-    let riskPercent = cbLevel > 0 ? 1.0 : 2.0; // Si venimos perdiendo, baja a 1%
+    const capital = 1000; 
+    const leverage = 20;  
+    let riskPercent = cbLevel > 0 ? 1.0 : 2.0; 
 
-    const maxRiskPercent = 0.5; // Distancia máxima del 0.5% real para SL (protege del x20)
+    const maxRiskPercent = 0.5; 
     let slDistance = atr * 1.2;
     const maxDistance = price * (maxRiskPercent / 100);
     if (slDistance > maxDistance) slDistance = maxDistance;
@@ -120,13 +120,11 @@ function calculateTradeLevels(price, direction, atr, edge, iaContext, cbLevel) {
     }
 
     const minMove = price * 0.002;
-    if (Math.abs(tp - entry) < minMove) return null; // Filtra trades basura
+    if (Math.abs(tp - entry) < minMove) return null; 
 
-    // Filtro de Liquidación estricto
     const liquidationDistance = 1 / leverage;
     if ((slDistance / price) > (liquidationDistance * 0.7)) return null;
 
-    // Cálculo matemático de volumen real en USD para mantener el riesgo fijo
     const riskAmount = capital * (riskPercent / 100);
     const priceDiff = Math.abs(entry - sl);
     const positionSizeUSDT = (riskAmount / priceDiff) * entry;
@@ -184,7 +182,95 @@ bot.onText(/\/scan/, async (msg) => {
 });
 
 console.log(`🤖 Quant Sniper V12.5 TACTICAL PRO iniciando...`);
-bot.sendMessage(chatId, '🟢 *Quant Sniper V12.5 TACTICAL PRO* encendido.\nModo: Semáforo Visual + IA Contextual + Módulo Trading Spot', { parse_mode: 'Markdown' });
+bot.sendMessage(chatId, '🟢 *Quant Sniper V12.5 TACTICAL PRO* encendido.\nModo: Semáforo Visual + IA a Demanda + Módulo Trading Spot', { parse_mode: 'Markdown' });
+
+// === HANDLER DEL BOTÓN DE IA ===
+bot.on('callback_query', async (query) => {
+    const data = query.data;
+    if (!data.startsWith('analyze_')) return;
+
+    const sigId = data.split('_')[1];
+    const s = SIGNAL_CACHE.get(sigId);
+
+    if (!s) {
+        return bot.answerCallbackQuery(query.id, { text: "⏳ La señal expiró o ya no está en caché.", show_alert: true });
+    }
+
+    bot.answerCallbackQuery(query.id, { text: "Iniciando análisis cuántico..." });
+
+    const loadingMsg = s.msgText.replace('⏳ _Esperando orden para análisis IA..._', '⏳ _Analizando contexto con Gemini AI..._');
+    await bot.editMessageText(loadingMsg, { chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown' });
+
+    let iaVerdictText = "PASS"; 
+    let iaScore = 0;
+    let iaContextText = "UNKNOWN";
+    let iaReasoning = "Error al consultar la IA.";
+    let tradingModuleText = "";
+
+    const promptText = `Eres un Quant Trader Institucional. Tu tarea es doble: decidir el SCORE de ejecución y CLASIFICAR el contexto de mercado.
+    MODO DE LA SEÑAL: ${s.modeString} (Dual Score: ${s.dualScore.toFixed(1)}).
+    
+    DATOS:
+    Activo: ${s.assetId} | Timeframe: ${s.tf} | Dir: ${s.analysis.direction} | Prob: ${s.analysis.prob.toFixed(1)}% | Edge Real: ${s.analysis.edge.toFixed(2)}%
+    Stability: ${(s.analysis.stability * 100).toFixed(0)}% | LOB Ponderado: ${s.obi.toFixed(3)} | Momentum: ${s.momentumSlope.toFixed(4)} | Macro 4H: ${s.macro.h4}
+    
+    REGLAS:
+    1. Define el TRADE_CONTEXT basado en el Momentum y Macro H4:
+       - CONTINUATION: El Momentum y la Macro están a favor de la dirección.
+       - REVERSAL: Entrando en contra de la Macro pero el Momentum reciente es fuerte a favor.
+       - TRAP: Divergencia peligrosa, baja probabilidad, o choque de liquidez.
+    2. Define el AI_SCORE (0 a 100): Evalúa qué tan buena es la oportunidad basándote en el Edge, el LOB, el modo táctico y el contexto. >65 significa EXECUTE.
+    
+    Responde EXCLUSIVAMENTE en este formato exacto, respetando las mayúsculas:
+    AI_SCORE: (Número del 0 al 100)
+    TRADE_CONTEXT: (CONTINUATION, REVERSAL, o TRAP)
+    REASONING: (Tu argumento táctico en 2 oraciones).`;
+
+    try {
+        const apiKey = process.env.GEMINI_API_KEY;
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
+        const result = await axios.post(url, { contents: [{ parts: [{ text: promptText }] }], generationConfig: { temperature: 0.2 } });
+        const text = result.data.candidates[0].content.parts[0].text;
+        
+        const scoreMatch = text.match(/AI_SCORE:\s*(\d+)/i);
+        iaScore = scoreMatch ? parseInt(scoreMatch[1]) : 0;
+        
+        const contextMatch = text.match(/TRADE_CONTEXT:\s*(CONTINUATION|REVERSAL|TRAP)/i);
+        iaContextText = contextMatch ? contextMatch[1].toUpperCase() : 'UNKNOWN';
+        
+        const reasonMatch = text.match(/REASONING:\s*([\s\S]*?)$/i);
+        iaReasoning = reasonMatch ? reasonMatch[1].trim().replace(/[*_[\]]/g, '') : 'Análisis completado.';
+        
+        const isExecute = iaScore >= 65;
+        const verdictIcon = isExecute ? '🚀 *EXECUTE TRADE*' : '⛔ *PASS*';
+        iaVerdictText = isExecute ? "EXECUTE" : "PASS";
+
+        if (isExecute && iaContextText !== "TRAP") {
+            const tradeData = calculateTradeLevels(s.analysis.currentPrice, s.analysis.direction, s.analysis.currentATR, s.analysis.edge, iaContextText, circuitBreakerLevel);
+            if (tradeData) {
+                tradingModuleText = `\n\n💰 *MODO TRADING (Spot/CFD x20)*\n📍 *Entry:* ${tradeData.entry}\n🛑 *Stop Loss:* ${tradeData.sl}\n🎯 *Take Profit:* ${tradeData.tp}\n⚖️ *R:R:* 1:${tradeData.rr}\n\n💼 *Volumen sugerido:* ${tradeData.positionSize} USDT\n📉 *Riesgo:* ${tradeData.riskPercent}% del capital`;
+            }
+        }
+
+        const updatedMsg = s.msgText.replace('⏳ _Esperando orden para análisis IA..._', `*Veredicto IA:* ${verdictIcon} (Score: ${iaScore}/100)\n*Contexto IA:* 🧩 ${iaContextText}\n_📝 ${iaReasoning}_${tradingModuleText}`);
+        await bot.editMessageText(updatedMsg, { chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown' });
+
+        const auditEntry = PENDING_AUDITS.find(a => a.sigId === sigId);
+        if (auditEntry) {
+            auditEntry.logData.iaVerdict = iaVerdictText;
+            auditEntry.logData.iaScore = iaScore;
+            auditEntry.logData.iaContext = iaContextText;
+        }
+
+    } catch (e) {
+        await bot.editMessageText(s.msgText.replace('⏳ _Esperando orden para análisis IA..._', '❌ _Fallo de conexión IA. Intenta de nuevo._'), { 
+            chat_id: chatId, 
+            message_id: query.message.message_id, 
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: [[ { text: '🔄 Reintentar IA', callback_data: `analyze_${sigId}` } ]] }
+        });
+    }
+});
 
 // === MOTOR CUANTITATIVO ===
 function calculateZScore(values) {
@@ -390,7 +476,6 @@ function runAnalysisElite(candles) {
         (regime === "TREND" && edge < 0.3)
     ) return null;
 
-    // Retornamos también el precio actual y el ATR para cálculos de Trading Spot
     return { prob: finalProb, direction: signal, edge: (signal === 'BUY' ? edge : -edge), absEdge: edge, stability, n: topMatches.length, acs: (edge / 50) * stability * (topMatches.length / 100), cwev: edge * stability, currentPrice: candles[candles.length - 1].c, currentATR: currentATR };
 }
 
@@ -478,18 +563,17 @@ async function globalScan(scanType = 'auto') {
     }
 
     const validSignals = [];
-    
-    // --- LÓGICA DE TIMEFRAMES RESTRINGIDA ---
-    const now = new Date(getSyncedTime());
-    const currentMinute = now.getMinutes();
+    let tfs = [{ tf: '5M', aggregate: 1 }]; 
 
-    let tfs = [{ tf: '5M', aggregate: 1 }]; // 5m siempre activo
-    
-    // 15m, 30m y 1h SOLO se activan cuando corresponden, sin importar modo auto o manual
-    if ([13, 14, 15, 28, 29, 30, 43, 44, 45, 58, 59, 0].includes(currentMinute)) tfs.push({ tf: '15M', aggregate: 3 });
-    if ([28, 29, 30, 58, 59, 0].includes(currentMinute)) tfs.push({ tf: '30M', aggregate: 6 });
-    if ([58, 59, 0].includes(currentMinute)) tfs.push({ tf: '1H', aggregate: 12 });
-    // ----------------------------------------
+    if (scanType === 'auto') {
+        const now = new Date(getSyncedTime());
+        const currentMinute = now.getMinutes();
+        if ([13, 28, 43, 58].includes(currentMinute)) tfs.push({ tf: '15M', aggregate: 3 });
+        if ([28, 58].includes(currentMinute)) tfs.push({ tf: '30M', aggregate: 6 });
+        if (currentMinute === 58) tfs.push({ tf: '1H', aggregate: 12 });
+    } else {
+        tfs = [{ tf: '5M', aggregate: 1 }, { tf: '15M', aggregate: 3 }, { tf: '30M', aggregate: 6 }, { tf: '1H', aggregate: 12 }];
+    }
 
     for (const asset of CONFIG.MARKETS) {
         if (!allowedAssets.includes(asset.id)) continue;
@@ -574,8 +658,6 @@ async function globalScan(scanType = 'auto') {
 
     const consensusSignals = [];
 
-    console.log(`[DEBUG] Timeframes evaluados en esta pasada: ${tfs.map(t => t.tf).join(', ')}`);
-
     for (const s of validSignals) {
         const isB = s.analysis.direction === "BUY";
         const passMacro = !(isB && s.macro.h4 === -1) && !(!isB && s.macro.h4 === 1);
@@ -612,47 +694,38 @@ async function globalScan(scanType = 'auto') {
         const lastTradesAsset = parsedData.filter(r => r.Activo === s.assetId).slice(-5);
         const recentLossesAsset = lastTradesAsset.filter(r => r.Veredicto === 'PERDIDA').length;
 
-        // --- DEBUGS PARA CONSOLA ---
-        let eliteRejections = [];
-        let agrRejections = [];
-
         // --- 🟢 EVALUACIÓN ELITE ---
         let isElite = true;
-        if (!passMacro) { isElite = false; eliteRejections.push('Macro H4 en contra'); }
-        if (s.analysis.cwev < 1.2) { isElite = false; eliteRejections.push(`CWEV muy bajo (${s.analysis.cwev.toFixed(2)})`); }
-        if (recentLossesAsset >= 3) { isElite = false; eliteRejections.push('Demasiadas pérdidas recientes en el activo'); }
-        if (isB && momentumSlope < 0) { isElite = false; eliteRejections.push('Momentum cayendo para un BUY'); }
-        if (!isB && momentumSlope > 0) { isElite = false; eliteRejections.push('Momentum subiendo para un SELL'); }
-        if (isB && nearResistance) { isElite = false; eliteRejections.push('Chocando contra Resistencia'); } 
-        if (!isB && nearSupport) { isElite = false; eliteRejections.push('Peleando contra Soporte'); } 
-        if (s.analysis.prob < PROB_THRESHOLD) { isElite = false; eliteRejections.push(`Probabilidad baja (${s.analysis.prob.toFixed(1)}%)`); }
-        if (s.analysis.acs < 0.015) { isElite = false; eliteRejections.push('Alpha (ACS) muy bajo'); }
-        if (s.analysis.stability < 0.40) { isElite = false; eliteRejections.push(`Inestable (${s.analysis.stability.toFixed(2)})`); }
-        if (s.analysis.n < 15) { isElite = false; eliteRejections.push(`Pocas muestras (${s.analysis.n})`); }
-        if (!((isB && s.obi > 0) || (!isB && s.obi < 0))) { isElite = false; eliteRejections.push('Libro de órdenes (LOB) en contra'); }
-        if (!statisticalStrength(s.analysis.n, s.analysis.acs, s.analysis.prob)) { isElite = false; eliteRejections.push('Sin fuerza estadística'); }
+        if (!passMacro) isElite = false;
+        if (s.analysis.cwev < 1.2) isElite = false;
+        if (recentLossesAsset >= 3) isElite = false;
+        if (isB && momentumSlope < 0) isElite = false;
+        if (!isB && momentumSlope > 0) isElite = false;
+        if (isB && nearResistance) isElite = false; 
+        if (!isB && nearSupport) isElite = false; 
+        if (s.analysis.prob < PROB_THRESHOLD) isElite = false;
+        if (s.analysis.acs < 0.015) isElite = false;
+        if (s.analysis.stability < 0.40) isElite = false;
+        if (s.analysis.n < 15) isElite = false;
+        if (!((isB && s.obi > 0) || (!isB && s.obi < 0))) isElite = false;
+        if (!statisticalStrength(s.analysis.n, s.analysis.acs, s.analysis.prob)) isElite = false;
 
         // --- 🟡 EVALUACIÓN AGRESIVA ---
         let isAggressive = true;
-        if (!passMacro) { isAggressive = false; agrRejections.push('Macro H4 en contra'); }
-        if (s.analysis.prob < 54) { isAggressive = false; agrRejections.push(`Probabilidad baja (${s.analysis.prob.toFixed(1)}%)`); }
-        if (s.analysis.stability < 0.35) { isAggressive = false; agrRejections.push(`Inestable (${s.analysis.stability.toFixed(2)})`); }
-        if (s.analysis.n < 12) { isAggressive = false; agrRejections.push(`Pocas muestras (${s.analysis.n})`); }
+        if (!passMacro) isAggressive = false; 
+        if (s.analysis.prob < 54) isAggressive = false; 
+        if (s.analysis.stability < 0.35) isAggressive = false; 
+        if (s.analysis.n < 12) isAggressive = false; 
         
         let passMomentumAgr = true;
         if (isB && momentumSlope < -0.0001) passMomentumAgr = false;
         if (!isB && momentumSlope > 0.0001) passMomentumAgr = false;
-        if (!passMomentumAgr) { isAggressive = false; agrRejections.push('Momentum fuertemente en contra'); }
+        if (!passMomentumAgr) isAggressive = false;
 
         if (isElite || isAggressive) {
             s.isElite = isElite;
             s.isAggressive = isAggressive;
             consensusSignals.push(s);
-            console.log(`[DEBUG] ✅ SEÑAL APROBADA: ${s.assetId} | TF: ${s.tf} | Dir: ${s.analysis.direction}`);
-        } else {
-            console.log(`[DEBUG] ❌ DESCARTADA: ${s.assetId} | TF: ${s.tf} | Dir: ${s.analysis.direction}`);
-            console.log(`    -> Filtro Elite falló por: ${eliteRejections.join(', ')}`);
-            console.log(`    -> Filtro Agr falló por: ${agrRejections.join(', ')}`);
         }
     }
     
@@ -666,7 +739,6 @@ async function globalScan(scanType = 'auto') {
 
         for (const s of consensusSignals) {
             const sigId = `sig_${signalCounter++}`;
-            SIGNAL_CACHE.set(sigId, s);
             const icon = s.analysis.direction === 'BUY' ? '🟢' : '🔴';
             const timeData = getRecommendedTimeData(s.tf, currentServerTime);
             const edgeSign = s.analysis.edge > 0 ? '+' : '';
@@ -706,7 +778,7 @@ async function globalScan(scanType = 'auto') {
             const msgText = `🎯 *${s.assetId} | ${s.tf}*
 
 🧠 *MODO DUAL*
-🟢 ELITE    → ${eliteCheck}
+🟢 ELITE      → ${eliteCheck}
 🟡 AGRESIVO   → ${agrCheck}
 
 🏆 *DUAL SCORE:* ${scoreVisual}
@@ -729,74 +801,28 @@ ${timingGap}
 Confianza:    ${confBar} (${s.analysis.prob.toFixed(0)}%)
 Anticipación: ${antBar} (${anticipationLevel}%)
 
-⏳ _Analizando contexto con Gemini AI..._`;
+⏳ _Esperando orden para análisis IA..._`;
 
-            const sentMsg = await bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' });
+            // Guardamos todo en caché para usarlo en el callback del botón
+            s.msgText = msgText;
+            s.modeString = modeString;
+            s.dualScore = dualScore;
+            SIGNAL_CACHE.set(sigId, s);
 
-            let iaVerdictText = "PASS"; 
-            let iaScore = 0;
-            let iaContextText = "UNKNOWN";
-            let iaReasoning = "Error al consultar la IA.";
-            let tradingModuleText = "";
-            
-            const promptText = `Eres un Quant Trader Institucional. Tu tarea es doble: decidir el SCORE de ejecución y CLASIFICAR el contexto de mercado.
-            MODO DE LA SEÑAL: ${modeString} (Dual Score: ${dualScore.toFixed(1)}).
-            
-            DATOS:
-            Activo: ${s.assetId} | Timeframe: ${s.tf} | Dir: ${s.analysis.direction} | Prob: ${s.analysis.prob.toFixed(1)}% | Edge Real: ${s.analysis.edge.toFixed(2)}%
-            Stability: ${(s.analysis.stability * 100).toFixed(0)}% | LOB Ponderado: ${s.obi.toFixed(3)} | Momentum: ${s.momentumSlope.toFixed(4)} | Macro 4H: ${s.macro.h4}
-            
-            REGLAS:
-            1. Define el TRADE_CONTEXT basado en el Momentum y Macro H4:
-               - CONTINUATION: El Momentum y la Macro están a favor de la dirección.
-               - REVERSAL: Entrando en contra de la Macro pero el Momentum reciente es fuerte a favor.
-               - TRAP: Divergencia peligrosa, baja probabilidad, o choque de liquidez.
-            2. Define el AI_SCORE (0 a 100): Evalúa qué tan buena es la oportunidad basándote en el Edge, el LOB, el modo táctico y el contexto. >65 significa EXECUTE.
-            
-            Responde EXCLUSIVAMENTE en este formato exacto, respetando las mayúsculas:
-            AI_SCORE: (Número del 0 al 100)
-            TRADE_CONTEXT: (CONTINUATION, REVERSAL, o TRAP)
-            REASONING: (Tu argumento táctico en 2 oraciones).`;
-
-            try {
-                const apiKey = process.env.GEMINI_API_KEY;
-                const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
-                const result = await axios.post(url, { contents: [{ parts: [{ text: promptText }] }], generationConfig: { temperature: 0.2 } });
-                const text = result.data.candidates[0].content.parts[0].text;
-                
-                const scoreMatch = text.match(/AI_SCORE:\s*(\d+)/i);
-                iaScore = scoreMatch ? parseInt(scoreMatch[1]) : 0;
-                
-                const contextMatch = text.match(/TRADE_CONTEXT:\s*(CONTINUATION|REVERSAL|TRAP)/i);
-                iaContextText = contextMatch ? contextMatch[1].toUpperCase() : 'UNKNOWN';
-                
-                const reasonMatch = text.match(/REASONING:\s*([\s\S]*?)$/i);
-                iaReasoning = reasonMatch ? reasonMatch[1].trim().replace(/[*_[\]]/g, '') : 'Análisis completado.';
-                
-                const isExecute = iaScore >= 65;
-                const verdictIcon = isExecute ? '🚀 *EXECUTE TRADE*' : '⛔ *PASS*';
-                iaVerdictText = isExecute ? "EXECUTE" : "PASS";
-
-                // 🟢 MÓDULO DE TRADING SPOT SI LA IA LO APRUEBA Y ES DE CALIDAD
-                if (isExecute && iaContextText !== "TRAP") {
-                    const tradeData = calculateTradeLevels(s.analysis.currentPrice, s.analysis.direction, s.analysis.currentATR, s.analysis.edge, iaContextText, circuitBreakerLevel);
-                    if (tradeData) {
-                        tradingModuleText = `\n\n💰 *MODO TRADING (Spot/CFD x20)*\n📍 *Entry:* ${tradeData.entry}\n🛑 *Stop Loss:* ${tradeData.sl}\n🎯 *Take Profit:* ${tradeData.tp}\n⚖️ *R:R:* 1:${tradeData.rr}\n\n💼 *Volumen sugerido:* ${tradeData.positionSize} USDT\n📉 *Riesgo:* ${tradeData.riskPercent}% del capital`;
-                    }
+            const sentMsg = await bot.sendMessage(chatId, msgText, { 
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '🤖 Analizar con IA', callback_data: `analyze_${sigId}` }
+                    ]]
                 }
-
-                const updatedMsg = msgText.replace('⏳ _Analizando contexto con Gemini AI..._', `*Veredicto IA:* ${verdictIcon} (Score: ${iaScore}/100)\n*Contexto IA:* 🧩 ${iaContextText}\n_📝 ${iaReasoning}_${tradingModuleText}`);
-                bot.editMessageText(updatedMsg, { chat_id: chatId, message_id: sentMsg.message_id, parse_mode: 'Markdown' });
-
-            } catch (e) {
-                bot.editMessageText(msgText.replace('⏳ _Analizando contexto con Gemini AI..._', '❌ _Fallo de conexión IA. Juzgar manualmente._'), { chat_id: chatId, message_id: sentMsg.message_id, parse_mode: 'Markdown' });
-            }
+            });
             
             logToCSV({
                 asset: s.assetId, tf: s.tf, dir: s.analysis.direction, prob: s.analysis.prob.toFixed(1),
                 lob: s.obi.toFixed(3), edge: s.analysis.edge.toFixed(2), alpha: s.analysis.acs.toFixed(3),
                 stab: (s.analysis.stability * 100).toFixed(0), cwev: s.analysis.cwev.toFixed(1),
-                samples: s.analysis.n, veredicto: 'PENDIENTE', iaVerdict: iaVerdictText, iaScore: iaScore, iaContext: iaContextText, mode: modeString
+                samples: s.analysis.n, veredicto: 'PENDIENTE', iaVerdict: 'NO_SOLICITADO', iaScore: 0, iaContext: 'N/A', mode: modeString
             });
 
             PENDING_AUDITS.push({
@@ -806,7 +832,7 @@ Anticipación: ${antBar} (${anticipationLevel}%)
                     prob: s.analysis.prob.toFixed(1), lob: s.obi.toFixed(3), 
                     edge: s.analysis.edge.toFixed(2), alpha: s.analysis.acs.toFixed(3),
                     stab: (s.analysis.stability * 100).toFixed(0), cwev: s.analysis.cwev.toFixed(1),
-                    samples: s.analysis.n, iaVerdict: iaVerdictText, iaScore: iaScore, iaContext: iaContextText, mode: modeString
+                    samples: s.analysis.n, iaVerdict: 'NO_SOLICITADO', iaScore: 0, iaContext: 'N/A', mode: modeString
                 }
             });
         }
@@ -821,7 +847,6 @@ setInterval(() => {
     const now = new Date(getSyncedTime());
     const m = now.getMinutes();
     const s = now.getSeconds();
-    // CRON en el segundo 15 usando tiempo sincronizado
     if ((m % 5 === 3) && s === 15 && lastScanMinute !== m) {
         lastScanMinute = m;
         globalScan('auto');
