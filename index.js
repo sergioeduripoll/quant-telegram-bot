@@ -361,7 +361,36 @@ function getRecommendedTimeData(tfLabel, serverTime) {
     const format = (d) => d.toLocaleTimeString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', hour: '2-digit', minute: '2-digit', hour12: false });
     return { text: `${format(tStart)} - ${format(tEnd)}`, startTs: tStart.getTime(), endTs: tEnd.getTime() };
 }
+function scoreSignal(a, assetId) {
+    let score = 0;
 
+    // EDGE (contrarian para majors)
+    if (["BTC/USD","ETH/USD","SOL/USD","XRP/USD","BNB/USD","ADA/USD"].includes(assetId)) {
+        if (a.edge < -2) score += 40;
+        else if (a.edge < 0) score += 25;
+        else score -= 60;
+    }
+
+    // DOGE (tendencial)
+    if (assetId === "DOGE/USD") {
+        if (a.edge > 2) score += 40;
+        else if (a.edge > 0) score += 20;
+        else score -= 50;
+    }
+
+    // PROB ideal (zona ganadora del CSV)
+    if (a.prob >= 55 && a.prob <= 68) score += 25;
+    else if (a.prob > 75) score -= 20;
+
+    // STABILITY (baja gana más)
+    if (a.stability < 0.72) score += 20;
+    else if (a.stability > 0.80) score -= 25;
+
+    // BONUS por consistencia
+    if (a.n > 80) score += 10;
+
+    return score;
+}
 function runAnalysisElite(candles) {
     if (candles.length < 100) return null;
     const recentCandles = candles.slice(-50);
@@ -419,7 +448,18 @@ function runAnalysisElite(candles) {
     const finalProb = signal === "BUY" ? prob : 100 - prob;
     const edge = finalProb - CONFIG.BE;
 
-    return { prob: finalProb, direction: signal, edge: (signal === 'BUY' ? edge : -edge), absEdge: edge, stability, n: topMatches.length, acs: (edge / 50) * stability, cwev: edge * stability, currentPrice: candles[candles.length - 1].c, currentATR: currentATR };
+    return { 
+    prob: finalProb, 
+    direction: signal, 
+    edge: edge,
+    absEdge: Math.abs(edge),
+    stability: stability,
+    n: topMatches.length,
+    acs: (edge / 50) * stability,
+    cwev: edge * stability,
+    currentPrice: candles[candles.length - 1].c,
+    currentATR: currentATR
+};
 }
 
 function statisticalStrength(samples, alpha, prob) {
@@ -486,7 +526,7 @@ async function globalScan(scanType = 'auto') {
                 GLOBAL_CANDLE_CACHE.set(asset.id, historical);
             } else {
                 const recent = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=100`);
-                historical = [...historical.slice(-CONFIG.REQUEST_LIMIT), ...recent.data];
+                historical = [...historical.slice(-CONFIG.REQUEST_LIMIT), ...recent.data];GLOBAL_CANDLE_CACHE.set(asset.id, historical);
             }
             candlesByAsset[asset.id] = historical;
 
@@ -529,19 +569,37 @@ async function globalScan(scanType = 'auto') {
         let eR = [];
 
         // --- PRECISIÓN CSV FILTROS (INTEGRADO) ---
-        if (["BTC/USD", "SOL/USD", "XRP/USD", "BNB/USD", "ADA/USD"].includes(s.assetId)) {
+       if (["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "BNB/USD", "ADA/USD"].includes(s.assetId)) {
             if (s.analysis.edge > 0) { isElite = false; eR.push('Edge Trampa'); }
             if (isB) { isElite = false; eR.push('Solo SELL'); }
         }
-        if (s.assetId === "DOGE/USD") {
-            if (s.analysis.edge < 3) { isElite = false; eR.push('Edge Bajo'); }
-            if (s.tf === "15M") { isElite = false; eR.push('TF 15M Prohibido'); }
-        }
+                if (s.assetId === "DOGE/USD") {
+    if (s.analysis.edge < 2) { 
+        isElite = false; 
+        eR.push('Edge Insuficiente'); 
+    } else if (s.analysis.edge < 4) {
+        eR.push('Edge Bajo'); // informativo
+    }
+}
+
+// TF prohibido
+if (s.tf === "15M") { 
+    isElite = false; 
+    eR.push('TF 15M Prohibido'); 
+}
+
         if (["ADA/USD", "ETH/USD"].includes(s.assetId) && s.analysis.stability > 0.75) {
             isElite = false; eR.push('Stability Fakeout');
         }
 
         if (!passMacro || s.analysis.prob < 54) { isElite = false; isAggressive = false; }
+const score = scoreSignal(s.analysis, s.assetId);
+if (score < 60) {
+    isElite = false;
+    isAggressive = false;
+}
+// Evitar operar contra el patrón real del CSV
+
 
         if (isElite || isAggressive) {
             s.isElite = isElite; s.isAggressive = isAggressive;
@@ -579,7 +637,8 @@ setInterval(async () => {
         if (now >= a.endTs + 15000) {
             try {
                 const res = await axios.get(`${CONFIG.BINANCE_API}/klines?symbol=${a.symbolBinance}&interval=${a.tf.toLowerCase()}&limit=5`);
-                const candle = res.data.find(k => k[0] === a.startTs);
+                const tolerance = 60000; // 1 min
+                const candle = res.data.find(k => Math.abs(k[0] - a.startTs) < tolerance);
                 if (candle) {
                     const o = parseFloat(candle[1]), c = parseFloat(candle[4]);
                     const win = (a.direction === 'BUY' && c > o) || (a.direction === 'SELL' && c < o);
