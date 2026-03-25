@@ -32,10 +32,10 @@ const CONFIG = {
 
 // 🧠 PERFILES POR ACTIVO (Basado en el análisis de tu CSV)
 const ASSET_PROFILES = {
-    "ETH/USD": { minScoreMultiplier: 1.3, strictLOB: true, aiPenalty: -5 }, // ETH falla mucho, somos ultra estrictos y penalizamos score IA
+    "ETH/USD": { minScoreMultiplier: 1.3, strictLOB: true, aiPenalty: -5 }, // ETH falla mucho, somos ultra estrictos
     "BTC/USD": { minScoreMultiplier: 1.1, strictLOB: false, aiPenalty: 0 }, 
-    "DOGE/USD": { minScoreMultiplier: 0.9, strictLOB: false, aiPenalty: 5 }, // DOGE funciona bien, bonificamos score IA
-    "XRP/USD": { minScoreMultiplier: 0.9, strictLOB: false, aiPenalty: 5 },  // XRP funciona bien, bonificamos score IA
+    "DOGE/USD": { minScoreMultiplier: 0.9, strictLOB: false, aiPenalty: 5 }, // DOGE funciona bien, flexibilidad
+    "XRP/USD": { minScoreMultiplier: 0.9, strictLOB: false, aiPenalty: 5 },  // XRP funciona bien, flexibilidad
     "SOL/USD": { minScoreMultiplier: 1.0, strictLOB: false, aiPenalty: 0 },
     "ADA/USD": { minScoreMultiplier: 1.1, strictLOB: true, aiPenalty: 0 },
     "BNB/USD": { minScoreMultiplier: 1.1, strictLOB: false, aiPenalty: 0 }
@@ -56,7 +56,6 @@ const SIGNAL_CACHE = new Map();
 let signalCounter = 0;
 const PENDING_AUDITS = [];
 
-// 🟢 Control Anti-Ruina Progresivo y Cache Global
 let globalPauseUntil = 0; 
 let circuitBreakerLevel = 0;
 let lastCircuitBreakerTradeCount = 0;
@@ -64,7 +63,7 @@ let autoLearningStats = { winrate: 0.5, total: 0 };
 let assetPerformance = {}; 
 const GLOBAL_CANDLE_CACHE = new Map(); 
 
-// === SINCRONIZACIÓN DE TIEMPO PRO ===
+// === SINCRONIZACIÓN DE TIEMPO ===
 let timeOffset = 0;
 async function syncTimeWithBinance() {
     try {
@@ -78,15 +77,9 @@ async function syncTimeWithBinance() {
 syncTimeWithBinance();
 setInterval(syncTimeWithBinance, 60 * 60 * 1000); 
 
-function getSyncedTime() {
-    return Date.now() + timeOffset;
-}
+function getSyncedTime() { return Date.now() + timeOffset; }
+function getLocalTime() { return new Date(getSyncedTime()).toLocaleTimeString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', hour12: false }); }
 
-function getLocalTime() {
-    return new Date(getSyncedTime()).toLocaleTimeString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', hour12: false });
-}
-
-// === SISTEMA DE LOGGING CSV ===
 function logToCSV(data) {
     const filePath = './auditoria_sniper.csv';
     const now = new Date(getSyncedTime());
@@ -97,7 +90,6 @@ function logToCSV(data) {
         const header = 'Fecha,Hora,Activo,TF,Dir,Prob,LOB,Edge,Alpha,Stability,CWEV,Samples,Veredicto,Open,Close,IA_Verdict,IA_Score,IA_Context,Mode,FinalScore\n';
         fs.writeFileSync(filePath, header);
     }
-
     const row = `${fecha},${hora},${data.asset || ''},${data.tf || ''},${data.dir || ''},${data.prob || ''},${data.lob || ''},${data.edge || ''},${data.alpha || ''},${data.stab || ''},${data.cwev || ''},${data.samples || ''},${data.veredicto || ''},${data.open || ''},${data.close || ''},${data.iaVerdict || ''},${data.iaScore || ''},${data.iaContext || ''},${data.mode || ''},${data.finalScore || ''}\n`;
     fs.appendFileSync(filePath, row);
 }
@@ -116,42 +108,34 @@ function calculateFinalScore(analysis, assetId) {
     const sampleFactor = Math.log(n + 1) / 5; 
     const probFactor = (prob - 50) / 50; 
     let baseScore = (Math.abs(edge) * stability * sampleFactor * probFactor);
-    
     const multiplier = ASSET_PROFILES[assetId] ? ASSET_PROFILES[assetId].minScoreMultiplier : 1.0;
     return baseScore / multiplier; 
 }
 
-function calculateTradeLevels(price, direction, atr, edge, iaContext, cbLevel, stability, iaScore) {
+// 💰 MÓDULO TRADING (Ahora independiente y primario)
+function calculateTradeLevels(price, direction, atr, edge, cbLevel, stability, iaContext = null, iaScore = null) {
     const capital = 1000; 
     const leverage = 20;  
     
     let riskPercent = (cbLevel > 0 || autoLearningStats.winrate < 0.45) ? 1.0 : 2.0; 
-    if (iaScore < 72) riskPercent *= 0.75; // Reducimos tamaño si es Modo Oportunidad
+    if (iaScore !== null && iaScore < 72) riskPercent *= 0.75; 
 
     const maxRiskPercent = 0.5; 
     let slDistance = atr * 1.2;
     const maxDistance = price * (maxRiskPercent / 100);
     if (slDistance > maxDistance) slDistance = maxDistance;
 
-    let rr = Math.max(1.2, edge / 2);
+    let rr = Math.max(1.2, Math.abs(edge) / 2);
     if (iaContext === "CONTINUATION") rr *= 1.4;
     if (iaContext === "REVERSAL") rr *= 0.7;
     if (stability > 0.7) rr *= 1.2;
     if (stability < 0.4) rr *= 0.85;
 
     let entry = price;
-    let sl, tp;
+    let sl = direction === "BUY" ? entry - slDistance : entry + slDistance;
+    let tp = direction === "BUY" ? entry + (slDistance * rr) : entry - (slDistance * rr);
 
-    if (direction === "BUY") {
-        sl = entry - slDistance;
-        tp = entry + (slDistance * rr);
-    } else {
-        sl = entry + slDistance;
-        tp = entry - (slDistance * rr);
-    }
-
-    const minMove = price * 0.002;
-    if (Math.abs(tp - entry) < minMove) return null; 
+    if (Math.abs(tp - entry) < price * 0.002) return null; 
 
     const liquidationDistance = 1 / leverage;
     if ((slDistance / price) > (liquidationDistance * 0.7)) return null;
@@ -181,12 +165,6 @@ function getDynamicThreshold(atr, price) {
     return threshold;
 }
 
-function getDynamicSecond(volatility) {
-    if (volatility > 0.004) return 5;
-    if (volatility < 0.0015) return 35;
-    return 15;
-}
-
 // === COMANDOS RESTAURADOS ===
 bot.onText(/\/start/, (msg) => {
     if (msg.chat.id.toString() === chatId) {
@@ -201,7 +179,7 @@ bot.onText(/\/scan/, async (msg) => {
 });
 
 console.log(`🤖 Quant Sniper V12.5 TACTICAL PRO iniciando...`);
-bot.sendMessage(chatId, '🟢 *Quant Sniper V12.5 TACTICAL PRO* encendido.\nModo: IA a Demanda + Perfiles de Activo', { parse_mode: 'Markdown' });
+bot.sendMessage(chatId, '🟢 *Quant Sniper V12.5 TACTICAL PRO* encendido.\nModo: Trading Previo + IA a Demanda + Perfiles de Activo', { parse_mode: 'Markdown' });
 
 // === MOTOR CUANTITATIVO RESTAURADO ===
 function calculateZScore(values) {
@@ -413,12 +391,7 @@ function runAnalysisElite(candles) {
 
     if (edge < 1.2 || (regime === "COMPRESSION" && edge < 6)) return null;
 
-    return { prob: finalProb, direction: signal, edge: (signal === 'BUY' ? edge : -edge), absEdge: edge, stability, n: topMatches.length, acs: (edge / 50) * stability * (topMatches.length / 100), cwev: edge * stability, currentPrice: candles[candles.length - 1].c, currentATR: currentATR };
-}
-
-function statisticalStrength(samples, alpha, prob) {
-    if(samples < 15) return false; 
-    return ((prob*0.5) + (alpha*0.3) + (Math.log(samples)/10*0.2)) > 0.45; 
+    return { prob: finalProb, direction: signal, edge: (signal === 'BUY' ? edge : -edge), absEdge: edge, stabilityRaw: stability, n: topMatches.length, acs: (edge / 50) * stability * (topMatches.length / 100), cwev: edge * stability, currentPrice: candles[candles.length - 1].c, currentATR: currentATR };
 }
 
 function makeProgressBar(percent) {
@@ -593,8 +566,8 @@ async function globalScan(scanType = 'auto') {
         const passFinalScore = finalScore >= 0.15;
         const recentLossesAsset = parsedData.filter(r => r.Activo === s.assetId).slice(-5).filter(r => r.Veredicto.includes('PERDIDA')).length;
 
-        let isElite = passRegime && passFinalScore && passMacro && s.analysis.cwev >= 1.2 && recentLossesAsset < 3 && s.analysis.prob >= currentProbThreshold && s.analysis.stability >= 0.40 && lobPass && statisticalStrength(s.analysis.n, s.analysis.acs, s.analysis.prob);
-        let isAggressive = passMacro && s.analysis.prob >= (currentProbThreshold - 2) && s.analysis.stability >= 0.35 && !((isB && momentumSlope < -0.0001) || (!isB && momentumSlope > 0.0001));
+        let isElite = passRegime && passFinalScore && passMacro && s.analysis.cwev >= 1.2 && recentLossesAsset < 3 && s.analysis.prob >= currentProbThreshold && s.analysis.stabilityRaw >= 0.40 && lobPass;
+        let isAggressive = passMacro && s.analysis.prob >= (currentProbThreshold - 2) && s.analysis.stabilityRaw >= 0.35 && !((isB && momentumSlope < -0.0001) || (!isB && momentumSlope > 0.0001));
 
         if (isElite || isAggressive) {
             s.isElite = isElite; s.isAggressive = isAggressive; s.momentumSlope = momentumSlope; 
@@ -617,30 +590,41 @@ async function globalScan(scanType = 'auto') {
             
             const dualScore = (s.isElite ? 0.6 : 0) + (s.isAggressive ? 0.4 : 0);
             let scoreVisual = dualScore === 1.0 ? "1.0 → PERFECTO" : dualScore === 0.6 ? "0.6 → SOLO ELITE" : "0.4 → SOLO AGRESIVO";
+            const icon = s.analysis.direction === 'BUY' ? '🟢' : '🔴';
             
             const confBar = makeProgressBar(s.analysis.prob); 
             const anticipationLevel = s.isAggressive ? 90 : 30;
             const antBar = makeProgressBar(anticipationLevel);
 
-            // 🎯 TARJETA VISUAL LIMPIA
-            const msgText = `🎯 *${s.assetId} | ${s.tf}*\n🧠 *MODO DUAL*\n🟢 ELITE    → ${s.isElite ? '✅' : '❌'}\n🟡 AGRESIVO → ${s.isAggressive ? '✅' : '❌'}\n\n🏆 *DUAL SCORE:* ${scoreVisual}\n📈 *Dirección:* ${s.analysis.direction}\n\n⚖️ *BALANCE*\nConfianza:    ${confBar} (${s.analysis.prob.toFixed(0)}%)\nAnticipación: ${antBar} (${anticipationLevel}%)\n\n*(Presioná el botón de abajo para el análisis IA y Setup de Trading)*`;
+            // 💰 TRADING GENERADO ANTES DE LA IA
+            const baseTradeData = calculateTradeLevels(s.analysis.currentPrice, s.analysis.direction, s.analysis.currentATR, s.analysis.absEdge, circuitBreakerLevel, s.analysis.stabilityRaw);
+            let tradingText = "";
+            if (baseTradeData) {
+                tradingText = `\n\n💰 *MODO TRADING (Spot/CFD x20)*\n📍 *Entry:* ${baseTradeData.entry} | 🛑 *SL:* ${baseTradeData.sl} | 🎯 *TP:* ${baseTradeData.tp}\n⚖️ *R:R:* 1:${baseTradeData.rr} | 💼 *Volumen sugerido:* ${baseTradeData.positionSize} USDT\n📉 *Riesgo:* ${baseTradeData.riskPercent}% del capital`;
+            }
 
-            const inlineKeyboard = {
+            // 🎯 TARJETA VISUAL COMPLETA CON TRADING
+            const msgText = `🎯 *${s.assetId} | ${s.tf}*\n🧠 *MODO DUAL*\n🟢 ELITE    → ${s.isElite ? '✅' : '❌'}\n🟡 AGRESIVO → ${s.isAggressive ? '✅' : '❌'}\n\n🏆 *DUAL SCORE:* ${scoreVisual}\n📈 *Dirección:* ${icon} *${s.analysis.direction}*\n\n⚖️ *BALANCE*\nConfianza:    ${confBar} (${s.analysis.prob.toFixed(0)}%)\nAnticipación: ${antBar} (${anticipationLevel}%)${tradingText}`;
+
+            // Guardamos el texto base para la IA
+            s.msgText = msgText;
+
+            const opts = {
+                parse_mode: 'Markdown',
                 reply_markup: {
-                    inline_keyboard: [[ { text: "🧠 Solicitar Análisis IA & Trading", callback_data: `ia_${sigId}` } ]]
+                    inline_keyboard: [[ { text: "🧠 Análisis IA de Contexto", callback_data: `ia_${sigId}` } ]]
                 }
             };
 
-            const sentMsg = await bot.sendMessage(chatId, msgText, inlineKeyboard);
+            const sentMsg = await bot.sendMessage(chatId, msgText, opts);
 
-            // Guardamos la señal como PENDIENTE de resolución para el Cron de Binance
             const timeData = getRecommendedTimeData(s.tf, currentServerTime);
             PENDING_AUDITS.push({
                 sigId, assetId: s.assetId, symbolBinance: s.symbolBinance, tf: s.tf, direction: s.analysis.direction,
                 startTs: timeData.startTs, endTs: timeData.endTs, messageId: sentMsg.message_id, retries: 0,
                 logData: {
                     prob: s.analysis.prob.toFixed(1), lob: s.obi.toFixed(3), edge: s.analysis.edge.toFixed(2), 
-                    alpha: s.analysis.acs.toFixed(3), stab: (s.analysis.stability * 100).toFixed(0), cwev: s.analysis.cwev.toFixed(1),
+                    alpha: s.analysis.acs.toFixed(3), stab: (s.analysis.stabilityRaw * 100).toFixed(0), cwev: s.analysis.cwev.toFixed(1),
                     samples: s.analysis.n, iaVerdict: 'NO_SOLICITADO', iaScore: 0, iaContext: 'N/A', 
                     mode: s.isElite ? 'ELITE' : 'AGRESIVO', finalScore: s.finalScore.toFixed(2)
                 }
@@ -653,12 +637,14 @@ async function globalScan(scanType = 'auto') {
 bot.on('callback_query', async (query) => {
     const action = query.data;
     if (action.startsWith('ia_')) {
-        const sigId = action.split('_')[1];
+        const sigId = action.replace('ia_', '');
         const s = SIGNAL_CACHE.get(sigId);
+        
         if (!s) return bot.answerCallbackQuery(query.id, { text: "Señal expirada o no encontrada.", show_alert: true });
-
-        const loadingMsg = await bot.sendMessage(chatId, '⏳ _Analizando contexto con Gemini AI..._', { parse_mode: 'Markdown' });
         bot.answerCallbackQuery(query.id);
+
+        const originalMsg = s.msgText;
+        await bot.editMessageText(originalMsg + '\n\n⏳ _Consultando a Gemini AI..._', { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: 'Markdown' });
 
         const assetPerf = assetPerformance[s.assetId] !== undefined ? `${(assetPerformance[s.assetId]*100).toFixed(0)}%` : 'N/A';
         const aiPenalty = ASSET_PROFILES[s.assetId] ? ASSET_PROFILES[s.assetId].aiPenalty : 0;
@@ -676,17 +662,10 @@ bot.on('callback_query', async (query) => {
             const ctxMatch = text.match(/TRADE_CONTEXT:\s*(\w+)/i); if (ctxMatch) iaCtx = ctxMatch[1].toUpperCase();
             const reasonMatch = text.match(/REASONING:\s*([\s\S]*?)$/i); if (reasonMatch) iaReason = reasonMatch[1].trim();
 
-            let tradingModule = "";
-            if (iaScore >= MIN_AI_SCORE && iaCtx !== "TRAP") {
-                const trade = calculateTradeLevels(s.analysis.currentPrice, s.analysis.direction, s.analysis.currentATR, s.analysis.absEdge, iaCtx, circuitBreakerLevel, s.analysis.stability, iaScore);
-                const label = iaScore >= 72 ? "🟢 ELITE" : "🟡 OPORTUNIDAD";
-                tradingModule = `\n\n💰 *TRADING ${label}*\n📍 *Ent:* ${trade.entry} | 🛑 *SL:* ${trade.sl} | 🎯 *TP:* ${trade.tp}\n⚖️ *R:R:* 1:${trade.rr} | 💼 *Vol:* ${trade.positionSize} USDT\n📉 *Riesgo:* ${trade.riskPercent}%`;
-            }
+            const aiText = `\n\n🤖 *VEREDICTO IA:* ${iaScore>=MIN_AI_SCORE?'🚀 EXECUTE':'⛔ PASS'} (${iaScore}/100)\n*Contexto:* 🧩 ${iaCtx}\n_📝 ${iaReason}_`;
             
-            const responseText = `*Veredicto IA:* ${iaScore>=MIN_AI_SCORE?'🚀':'⛔'} (${iaScore}/100)\n*Contexto IA:* 🧩 ${iaCtx}\n_📝 ${iaReason}_${tradingModule}`;
-            bot.editMessageText(responseText, { chat_id: chatId, message_id: loadingMsg.message_id, parse_mode: 'Markdown' });
+            bot.editMessageText(originalMsg + aiText, { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: 'Markdown' });
             
-            // Actualizamos el objeto en PENDING_AUDITS para que cuando cierre la vela, guarde el veredicto de la IA en el CSV
             const auditEntry = PENDING_AUDITS.find(a => a.sigId === sigId);
             if (auditEntry) {
                 auditEntry.logData.iaVerdict = iaScore >= MIN_AI_SCORE ? 'EXECUTE' : 'PASS';
@@ -694,7 +673,7 @@ bot.on('callback_query', async (query) => {
                 auditEntry.logData.iaContext = iaCtx;
             }
             
-        } catch (e) { bot.editMessageText('❌ _Error al contactar IA._', { chat_id: chatId, message_id: loadingMsg.message_id, parse_mode: 'Markdown' }); }
+        } catch (e) { bot.editMessageText(originalMsg + '\n\n❌ _Error al contactar IA._', { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: 'Markdown' }); }
     }
 });
 
@@ -713,7 +692,7 @@ setInterval(async () => {
     if ((now.getMinutes() % 5 === 3) && Math.abs(now.getSeconds() - targetSecond) <= 1) globalScan('auto'); 
 }, 1000);
 
-// 🚀 CRON DE AUDITORÍA RESTAURADO (Vital para aprender)
+// 🚀 CRON DE AUDITORÍA
 setInterval(async () => {
     for (let i = PENDING_AUDITS.length - 1; i >= 0; i--) {
         const audit = PENDING_AUDITS[i];
@@ -737,7 +716,6 @@ setInterval(async () => {
                 const isTie = closePrice === openPrice;
                 const iconResult = isTie ? 'EMPATE' : (isWin ? 'GANADA' : 'PERDIDA');
 
-                // Enviamos el mensaje de la auditoría usando logData que puede tener info de IA o no
                 const auditMsg = `🔍 *AUDITORÍA FINAL (BINANCE)*\n\n*Activo:* ${audit.assetId}\n*Dirección:* ${audit.direction}\n*Modo:* ${audit.logData.mode}\n*Contexto IA:* ${audit.logData.iaContext}\n*Veredicto IA:* ${audit.logData.iaVerdict} (Score: ${audit.logData.iaScore})\n\n🟢 Open: ${openPrice.toFixed(4)}\n🔴 Close: ${closePrice.toFixed(4)}\n\n*Resultado:* ${iconResult}`;
                 await bot.sendMessage(chatId, auditMsg, { parse_mode: 'Markdown', reply_to_message_id: audit.messageId });
                 
