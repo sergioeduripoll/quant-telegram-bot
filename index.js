@@ -9,7 +9,10 @@ const chatId = process.env.CHAT_ID;
 const bot = new TelegramBot(token, { polling: true });
 
 const patternLength = 6;
-const PROB_THRESHOLD = 54; 
+let BASE_PROB_THRESHOLD = 54; 
+let MIN_AI_SCORE = 65; 
+let lastSignalTime = 0;
+const SIGNAL_COOLDOWN = 60 * 1000; 
 
 const CONFIG = {
     BE: 54.94,
@@ -25,6 +28,17 @@ const CONFIG = {
         { id: 'DOGE/USD', symbolBinance: 'DOGEUSDT' },
         { id: 'BNB/USD', symbolBinance: 'BNBUSDT' }
     ]
+};
+
+// 🧠 PERFILES POR ACTIVO (Basado en el análisis de tu CSV)
+const ASSET_PROFILES = {
+    "ETH/USD": { minScoreMultiplier: 1.3, strictLOB: true, aiPenalty: -5 }, // ETH falla mucho, somos ultra estrictos y penalizamos score IA
+    "BTC/USD": { minScoreMultiplier: 1.1, strictLOB: false, aiPenalty: 0 }, 
+    "DOGE/USD": { minScoreMultiplier: 0.9, strictLOB: false, aiPenalty: 5 }, // DOGE funciona bien, bonificamos score IA
+    "XRP/USD": { minScoreMultiplier: 0.9, strictLOB: false, aiPenalty: 5 },  // XRP funciona bien, bonificamos score IA
+    "SOL/USD": { minScoreMultiplier: 1.0, strictLOB: false, aiPenalty: 0 },
+    "ADA/USD": { minScoreMultiplier: 1.1, strictLOB: true, aiPenalty: 0 },
+    "BNB/USD": { minScoreMultiplier: 1.1, strictLOB: false, aiPenalty: 0 }
 };
 
 const DEFAULT_ZONES = {
@@ -46,6 +60,8 @@ const PENDING_AUDITS = [];
 let globalPauseUntil = 0; 
 let circuitBreakerLevel = 0;
 let lastCircuitBreakerTradeCount = 0;
+let autoLearningStats = { winrate: 0.5, total: 0 }; 
+let assetPerformance = {}; 
 const GLOBAL_CANDLE_CACHE = new Map(); 
 
 // === SINCRONIZACIÓN DE TIEMPO PRO ===
@@ -78,15 +94,15 @@ function logToCSV(data) {
     const hora = now.toLocaleTimeString('es-AR', { hour12: false });
 
     if (!fs.existsSync(filePath)) {
-        const header = 'Fecha,Hora,Activo,TF,Dir,Prob,LOB,Edge,Alpha,Stability,CWEV,Samples,Veredicto,Open,Close,IA_Verdict,IA_Score,IA_Context,Mode\n';
+        const header = 'Fecha,Hora,Activo,TF,Dir,Prob,LOB,Edge,Alpha,Stability,CWEV,Samples,Veredicto,Open,Close,IA_Verdict,IA_Score,IA_Context,Mode,FinalScore\n';
         fs.writeFileSync(filePath, header);
     }
 
-    const row = `${fecha},${hora},${data.asset || ''},${data.tf || ''},${data.dir || ''},${data.prob || ''},${data.lob || ''},${data.edge || ''},${data.alpha || ''},${data.stab || ''},${data.cwev || ''},${data.samples || ''},${data.veredicto || ''},${data.open || ''},${data.close || ''},${data.iaVerdict || ''},${data.iaScore || ''},${data.iaContext || ''},${data.mode || ''}\n`;
+    const row = `${fecha},${hora},${data.asset || ''},${data.tf || ''},${data.dir || ''},${data.prob || ''},${data.lob || ''},${data.edge || ''},${data.alpha || ''},${data.stab || ''},${data.cwev || ''},${data.samples || ''},${data.veredicto || ''},${data.open || ''},${data.close || ''},${data.iaVerdict || ''},${data.iaScore || ''},${data.iaContext || ''},${data.mode || ''},${data.finalScore || ''}\n`;
     fs.appendFileSync(filePath, row);
 }
 
-// === FUNCIONES DE TRADING (NUEVO MÓDULO CFDs / QUANTFURY) ===
+// === FUNCIONES DE TRADING Y SCORE ===
 function formatPrice(val) {
     if (val < 0.01) return val.toFixed(6);
     if (val < 1) return val.toFixed(4);
@@ -94,19 +110,34 @@ function formatPrice(val) {
     return val.toFixed(2);
 }
 
-function calculateTradeLevels(price, direction, atr, edge, iaContext, cbLevel) {
-    const capital = 1000; // 👈 Tu capital en USD configurado aquí
-    const leverage = 20;  // 👈 Apalancamiento máximo usado
-    let riskPercent = cbLevel > 0 ? 1.0 : 2.0; // Si venimos perdiendo, baja a 1%
+// 🚀 SCORE FINAL REAL (Unificado + Multiplicador de Activo)
+function calculateFinalScore(analysis, assetId) {
+    const { edge, stability, n, prob } = analysis;
+    const sampleFactor = Math.log(n + 1) / 5; 
+    const probFactor = (prob - 50) / 50; 
+    let baseScore = (Math.abs(edge) * stability * sampleFactor * probFactor);
+    
+    const multiplier = ASSET_PROFILES[assetId] ? ASSET_PROFILES[assetId].minScoreMultiplier : 1.0;
+    return baseScore / multiplier; 
+}
 
-    const maxRiskPercent = 0.5; // Distancia máxima del 0.5% real para SL (protege del x20)
+function calculateTradeLevels(price, direction, atr, edge, iaContext, cbLevel, stability, iaScore) {
+    const capital = 1000; 
+    const leverage = 20;  
+    
+    let riskPercent = (cbLevel > 0 || autoLearningStats.winrate < 0.45) ? 1.0 : 2.0; 
+    if (iaScore < 72) riskPercent *= 0.75; // Reducimos tamaño si es Modo Oportunidad
+
+    const maxRiskPercent = 0.5; 
     let slDistance = atr * 1.2;
     const maxDistance = price * (maxRiskPercent / 100);
     if (slDistance > maxDistance) slDistance = maxDistance;
 
     let rr = Math.max(1.2, edge / 2);
-    if (iaContext === "CONTINUATION") rr *= 1.3;
-    if (iaContext === "REVERSAL") rr *= 0.8;
+    if (iaContext === "CONTINUATION") rr *= 1.4;
+    if (iaContext === "REVERSAL") rr *= 0.7;
+    if (stability > 0.7) rr *= 1.2;
+    if (stability < 0.4) rr *= 0.85;
 
     let entry = price;
     let sl, tp;
@@ -120,13 +151,11 @@ function calculateTradeLevels(price, direction, atr, edge, iaContext, cbLevel) {
     }
 
     const minMove = price * 0.002;
-    if (Math.abs(tp - entry) < minMove) return null; // Filtra trades basura
+    if (Math.abs(tp - entry) < minMove) return null; 
 
-    // Filtro de Liquidación estricto
     const liquidationDistance = 1 / leverage;
     if ((slDistance / price) > (liquidationDistance * 0.7)) return null;
 
-    // Cálculo matemático de volumen real en USD para mantener el riesgo fijo
     const riskAmount = capital * (riskPercent / 100);
     const priceDiff = Math.abs(entry - sl);
     const positionSizeUSDT = (riskAmount / priceDiff) * entry;
@@ -137,40 +166,28 @@ function calculateTradeLevels(price, direction, atr, edge, iaContext, cbLevel) {
         tp: formatPrice(tp),
         rr: rr.toFixed(1),
         positionSize: positionSizeUSDT.toFixed(0),
-        riskPercent: riskPercent
+        riskPercent: riskPercent.toFixed(1)
     };
 }
 
-// === LÓGICA DINÁMICA (Aprendizaje del CSV) ===
-function buildWinningZonesFromCSV(parsedData) {
-    const zones = JSON.parse(JSON.stringify(DEFAULT_ZONES));
-    if (!parsedData || parsedData.length === 0) return zones;
-
-    const getRange = (arr) => {
-        if (arr.length === 0) return null;
-        arr.sort((a,b)=>a-b);
-        return {
-            min: arr[Math.floor(arr.length * 0.15)],
-            max: arr[Math.floor(arr.length * 0.85)]
-        };
-    };
-
-    CONFIG.MARKETS.forEach(asset => {
-        const wins = parsedData.filter(r => r.Activo === asset.id && r.Veredicto === 'GANADA');
-        if (wins.length >= 10) {
-            const probs = wins.map(r => parseFloat(r.Prob)).filter(n => !isNaN(n));
-            const alphas = wins.map(r => parseFloat(r.Alpha)).filter(n => !isNaN(n));
-            const lobs = wins.map(r => parseFloat(r.LOB)).filter(n => !isNaN(n));
-
-            if(getRange(probs)) zones[asset.id].prob = getRange(probs);
-            if(getRange(alphas)) zones[asset.id].alpha = getRange(alphas);
-            if(getRange(lobs)) zones[asset.id].lob = getRange(lobs);
-        }
-    });
-    return zones;
+// 🧬 THRESHOLD Y CRON DINÁMICOS
+function getDynamicThreshold(atr, price) {
+    if (!atr || !price) return BASE_PROB_THRESHOLD;
+    const volatility = atr / price;
+    let threshold = BASE_PROB_THRESHOLD;
+    if (volatility > 0.004) threshold = 56;
+    else if (volatility < 0.0015) threshold = 52;
+    if (autoLearningStats.total >= 20 && autoLearningStats.winrate < 0.48) threshold += 1.5;
+    return threshold;
 }
 
-// === COMANDOS ===
+function getDynamicSecond(volatility) {
+    if (volatility > 0.004) return 5;
+    if (volatility < 0.0015) return 35;
+    return 15;
+}
+
+// === COMANDOS RESTAURADOS ===
 bot.onText(/\/start/, (msg) => {
     if (msg.chat.id.toString() === chatId) {
         bot.sendMessage(chatId, '👋 ¡Hola Ser! El *Quant Sniper V12.5 TACTICAL PRO* está operativo.', { parse_mode: 'Markdown' });
@@ -184,9 +201,9 @@ bot.onText(/\/scan/, async (msg) => {
 });
 
 console.log(`🤖 Quant Sniper V12.5 TACTICAL PRO iniciando...`);
-bot.sendMessage(chatId, '🟢 *Quant Sniper V12.5 TACTICAL PRO* encendido.\nModo: Semáforo Visual + IA Contextual + Módulo Trading Spot', { parse_mode: 'Markdown' });
+bot.sendMessage(chatId, '🟢 *Quant Sniper V12.5 TACTICAL PRO* encendido.\nModo: IA a Demanda + Perfiles de Activo', { parse_mode: 'Markdown' });
 
-// === MOTOR CUANTITATIVO ===
+// === MOTOR CUANTITATIVO RESTAURADO ===
 function calculateZScore(values) {
     if(values.length === 0) return 0;
     const mean = values.reduce((a,b)=>a+b, 0) / values.length;
@@ -253,14 +270,19 @@ function timeDecayWeight(ts, now) {
     return Math.exp(-(now - ts) / (1000 * 60 * 60 * 24 * 90)); 
 }
 
-function aggregateCandles(baseData, factor) {
-    let agg = [];
-    for (let i = 0; i < baseData.length; i += factor) {
-        let chunk = baseData.slice(i, i + factor);
-        if (chunk.length < factor) break;
-        agg.push({ o: chunk[0].o, h: Math.max(...chunk.map(c => c.h)), l: Math.min(...chunk.map(c => c.l)), c: chunk[chunk.length - 1].c });
+function aggregateCandles(candles, factor) {
+    const result = [];
+    for (let i = 0; i < candles.length; i += factor) {
+        const chunk = candles.slice(i, i + factor);
+        if (chunk.length < factor) continue;
+        result.push({
+            o: chunk[0].o,
+            h: Math.max(...chunk.map(c => c.h)),
+            l: Math.min(...chunk.map(c => c.l)),
+            c: chunk[chunk.length - 1].c
+        });
     }
-    return agg;
+    return result;
 }
 
 function precalcATR(candles, period = 14) {
@@ -292,17 +314,16 @@ function getRecommendedTimeData(tfLabel, serverTime) {
     const now = new Date(serverTime);
     let minutesToAdd = (tfLabel === '5M') ? 5 : (tfLabel === '15M') ? 15 : (tfLabel === '30M') ? 30 : (tfLabel === '1H') ? 60 : 0;
     if (minutesToAdd === 0) return null;
-    const msPerInterval = minutesToAdd * 60 * 1000;
-    const currentStart = new Date(Math.floor(now.getTime() / msPerInterval) * msPerInterval);
-    const tStart = new Date(currentStart.getTime() + msPerInterval);
-    const tEnd = new Date(tStart.getTime() + msPerInterval);
+    
+    const currentMs = now.getTime();
+    const intervalMs = minutesToAdd * 60 * 1000;
+    const startTs = Math.ceil(currentMs / intervalMs) * intervalMs;
+    const tStart = new Date(startTs);
+    const tEnd = new Date(startTs + intervalMs);
+
     const format = (d) => d.toLocaleTimeString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', hour: '2-digit', minute: '2-digit', hour12: false });
     
-    return {
-        text: `${format(tStart)} - ${format(tEnd)}`,
-        startTs: tStart.getTime(),
-        endTs: tEnd.getTime()
-    };
+    return { text: `${format(tStart)} - ${format(tEnd)}`, startTs: tStart.getTime(), endTs: tEnd.getTime() };
 }
 
 function runAnalysisElite(candles) {
@@ -320,6 +341,7 @@ function runAnalysisElite(candles) {
     const targetVector = buildPatternVector(candles, atrs, candles.length - 2);
 
     let matches = [];
+    let bucketCount = {};
     const startIdx = Math.max(40, candles.length - 10000);
 
     for (let i = startIdx; i < candles.length - 2 - patternLength - 3; i++) {
@@ -329,6 +351,11 @@ function runAnalysisElite(candles) {
 
             const sim = cosineSimilarity(targetVector, buildPatternVector(candles, atrs, histEndIdx));
             if (sim < 0.80) continue; 
+
+            const ts = Date.now() - ((candles.length - histEndIdx) * 5 * 60 * 1000);
+            const bucket = Math.floor(ts / (1000 * 60 * 60));
+            bucketCount[bucket] = (bucketCount[bucket] || 0) + 1;
+            if (bucketCount[bucket] > 3) continue;
 
             const next = candles[histEndIdx + 1];
             if (!next) continue;
@@ -340,7 +367,7 @@ function runAnalysisElite(candles) {
             const moveDown = candles[histEndIdx].c - next.l;
             const win = (moveUp > moveDown) ? 1 : 0; 
 
-            matches.push({ sim, win, timestamp: Date.now() - ((candles.length - histEndIdx) * 5 * 60 * 1000) });
+            matches.push({ sim, win, timestamp: ts });
         }
     }
 
@@ -384,13 +411,8 @@ function runAnalysisElite(candles) {
     const finalProb = signal === "BUY" ? prob : 100 - prob;
     const edge = finalProb - CONFIG.BE;
 
-    if (
-        edge < 1.2 ||
-        (regime === "COMPRESSION" && edge < 6) ||
-        (regime === "TREND" && edge < 0.3)
-    ) return null;
+    if (edge < 1.2 || (regime === "COMPRESSION" && edge < 6)) return null;
 
-    // Retornamos también el precio actual y el ATR para cálculos de Trading Spot
     return { prob: finalProb, direction: signal, edge: (signal === 'BUY' ? edge : -edge), absEdge: edge, stability, n: topMatches.length, acs: (edge / 50) * stability * (topMatches.length / 100), cwev: edge * stability, currentPrice: candles[candles.length - 1].c, currentATR: currentATR };
 }
 
@@ -408,21 +430,18 @@ function makeProgressBar(percent) {
 async function globalScan(scanType = 'auto') {
     const currentServerTime = getSyncedTime();
     
-    if (currentServerTime < globalPauseUntil) {
-        console.log(`[PAUSA] 🛡️ Protegiendo capital. Bot en reposo hasta ${new Date(globalPauseUntil).toLocaleTimeString('es-AR')}`);
-        return;
-    }
-
-    const startTime = getLocalTime();
-    console.log(`[${startTime}] 🚀 Iniciando Escaneo TACTICAL PRO...`);
+    if (currentServerTime < globalPauseUntil) return;
+    if (scanType === 'auto' && Date.now() - lastSignalTime < SIGNAL_COOLDOWN) return;
 
     let statusMsg;
-    try {
-        const title = scanType === 'auto' ? '🔄 *Scan Automático*' : '⏳ *Scan Manual*';
-        statusMsg = await bot.sendMessage(chatId, `${title}\n▶️ *Inicio:* ${startTime}\n_Analizando microestructura..._`, { parse_mode: 'Markdown' });
-    } catch(e) {}
+    if (scanType === 'manual') {
+        const startTime = getLocalTime();
+        try { statusMsg = await bot.sendMessage(chatId, `⏳ *Scan Manual*\n▶️ *Inicio:* ${startTime}\n_Analizando microestructura..._`, { parse_mode: 'Markdown' }); } catch(e) {}
+    }
 
-    const assetPerformance = {};
+    const now = new Date(currentServerTime);
+    const m = now.getMinutes();
+
     let parsedData = [];
     const candlesByAsset = {}; 
 
@@ -434,58 +453,52 @@ async function globalScan(scanType = 'auto') {
                 const headers = lines[0].split(',');
                 for (let i = 1; i < lines.length; i++) {
                     const vals = lines[i].split(',');
-                    let obj = {};
-                    headers.forEach((h, idx) => obj[h.trim()] = vals[idx]);
+                    let obj = {}; headers.forEach((h, idx) => obj[h.trim()] = vals[idx]);
                     parsedData.push(obj);
                 }
                 
-                CONFIG.MARKETS.forEach(m => {
-                    const assetRows = parsedData.filter(r => r.Activo === m.id && (r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA')).slice(-20);
-                    if (assetRows.length > 0) {
-                        const wins = assetRows.filter(r => r.Veredicto === 'GANADA').length;
-                        assetPerformance[m.id] = { wr: (wins / assetRows.length * 100).toFixed(1), count: assetRows.length };
+                CONFIG.MARKETS.forEach(asset => {
+                    const assetRows = parsedData.filter(r => r.Activo === asset.id && (r.Veredicto.includes('GANADA') || r.Veredicto.includes('PERDIDA'))).slice(-20);
+                    if(assetRows.length > 0) {
+                        const wins = assetRows.filter(r => r.Veredicto.includes('GANADA')).length;
+                        assetPerformance[asset.id] = wins / assetRows.length;
                     }
                 });
 
-                const totalFinishedTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').length;
-                const globalLastTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').slice(-4);
-                
-                if (globalLastTrades.length > 0 && globalLastTrades[globalLastTrades.length - 1].Veredicto === 'GANADA') {
-                    circuitBreakerLevel = 0;
+                const finished = parsedData.filter(r => r.Veredicto.includes('GANADA') || r.Veredicto.includes('PERDIDA')).slice(-50);
+                if (finished.length > 0) {
+                    const wins = finished.filter(r => r.Veredicto.includes('GANADA')).length;
+                    autoLearningStats = { winrate: wins / finished.length, total: finished.length };
+                    if (autoLearningStats.winrate > 0.55) MIN_AI_SCORE = 60;
+                    else if (autoLearningStats.winrate < 0.48) MIN_AI_SCORE = 75;
+                    else MIN_AI_SCORE = 68;
                 }
 
-                if (globalLastTrades.length === 4 && globalLastTrades.every(r => r.Veredicto === 'PERDIDA') && totalFinishedTrades > lastCircuitBreakerTradeCount) {
+                const totalFinishedTrades = parsedData.filter(r => r.Veredicto.includes('GANADA') || r.Veredicto.includes('PERDIDA')).length;
+                const globalLastTrades = parsedData.filter(r => r.Veredicto.includes('GANADA') || r.Veredicto.includes('PERDIDA')).slice(-4);
+                
+                if (globalLastTrades.length > 0 && globalLastTrades[globalLastTrades.length - 1].Veredicto.includes('GANADA')) circuitBreakerLevel = 0;
+
+                if (globalLastTrades.length === 4 && globalLastTrades.every(r => r.Veredicto.includes('PERDIDA')) && totalFinishedTrades > lastCircuitBreakerTradeCount) {
                     lastCircuitBreakerTradeCount = totalFinishedTrades;
                     const cooldownMinutes = 30 * Math.pow(2, Math.min(circuitBreakerLevel, 2));
                     globalPauseUntil = currentServerTime + (cooldownMinutes * 60 * 1000);
                     circuitBreakerLevel++;
-                    
-                    bot.sendMessage(chatId, `🚨 *CIRCUIT BREAKER ACTIVADO (Nivel ${circuitBreakerLevel})*\nSe detectaron 4 pérdidas globales consecutivas.\nEl bot se pausa automáticamente por *${cooldownMinutes} minutos* para proteger el capital.`, { parse_mode: 'Markdown' });
+                    bot.sendMessage(chatId, `🚨 *CIRCUIT BREAKER ACTIVADO (Nivel ${circuitBreakerLevel})*\nEl bot se pausa automáticamente por *${cooldownMinutes} minutos* para proteger el capital.`, { parse_mode: 'Markdown' });
                     return; 
                 }
             }
         }
     } catch (e) {}
 
-    CURRENT_WINNING_ZONES = buildWinningZonesFromCSV(parsedData);
-
     let allowedAssets = CONFIG.MARKETS.map(m => m.id);
-    const assetsWithData = Object.keys(assetPerformance);
-    if (assetsWithData.length >= 3) {
-        allowedAssets = assetsWithData
-            .sort((a, b) => parseFloat(assetPerformance[b].wr) - parseFloat(assetPerformance[a].wr))
-            .slice(0, 3);
-    }
-
     const validSignals = [];
     let tfs = [{ tf: '5M', aggregate: 1 }]; 
 
     if (scanType === 'auto') {
-        const now = new Date(getSyncedTime());
-        const currentMinute = now.getMinutes();
-        if ([13, 28, 43, 58].includes(currentMinute)) tfs.push({ tf: '15M', aggregate: 3 });
-        if ([28, 58].includes(currentMinute)) tfs.push({ tf: '30M', aggregate: 6 });
-        if (currentMinute === 58) tfs.push({ tf: '1H', aggregate: 12 });
+        if ([13, 28, 43, 58].includes(m)) tfs.push({ tf: '15M', aggregate: 3 });
+        if ([28, 58].includes(m)) tfs.push({ tf: '30M', aggregate: 6 });
+        if (m === 58) tfs.push({ tf: '1H', aggregate: 12 });
     } else {
         tfs = [{ tf: '5M', aggregate: 1 }, { tf: '15M', aggregate: 3 }, { tf: '30M', aggregate: 6 }, { tf: '1H', aggregate: 12 }];
     }
@@ -495,7 +508,6 @@ async function globalScan(scanType = 'auto') {
 
         try {
             let historical = GLOBAL_CANDLE_CACHE.get(asset.id);
-            
             if (!historical) {
                 const histRes = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=${CONFIG.REQUEST_LIMIT}`);
                 historical = histRes.data;
@@ -503,27 +515,11 @@ async function globalScan(scanType = 'auto') {
                 GLOBAL_CANDLE_CACHE.set(asset.id, historical);
             } else {
                 const recentRes = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=100`);
-                const recentCandles = recentRes.data;
-                
-                if (recentCandles && recentCandles.length > 0) {
+                if (recentRes.data && recentRes.data.length > 0) {
                     const lastCached = historical[historical.length - 1];
-                    let overlapIdx = -1;
-                    
-                    for (let i = recentCandles.length - 1; i >= 0; i--) {
-                        const r = recentCandles[i];
-                        if (r.c === lastCached.c && r.o === lastCached.o && r.h === lastCached.h && r.l === lastCached.l) {
-                            overlapIdx = i;
-                            break;
-                        }
-                    }
-                    
-                    if (overlapIdx !== -1 && overlapIdx < recentCandles.length - 1) {
-                        historical.push(...recentCandles.slice(overlapIdx + 1));
-                    } else if (overlapIdx === -1) {
-                        const histRes = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=${CONFIG.REQUEST_LIMIT}`);
-                        historical = histRes.data;
-                    }
-                    
+                    let overlapIdx = recentRes.data.findIndex(r => r.c === lastCached.c && r.o === lastCached.o);
+                    if (overlapIdx !== -1) historical.push(...recentRes.data.slice(overlapIdx + 1));
+                    else historical = recentRes.data;
                     if (historical.length > 50000) historical = historical.slice(historical.length - 50000);
                     GLOBAL_CANDLE_CACHE.set(asset.id, historical);
                 }
@@ -542,24 +538,10 @@ async function globalScan(scanType = 'auto') {
             try {
                 const lobRes = await axios.get(`${CONFIG.BINANCE_API}/depth?symbol=${asset.symbolBinance}&limit=10`);
                 let bV=0, aV=0;
-                
-                if(lobRes.data.bids && lobRes.data.asks && lobRes.data.bids.length > 0 && lobRes.data.asks.length > 0) {
-                    const bestBid = parseFloat(lobRes.data.bids[0][0]);
-                    const bestAsk = parseFloat(lobRes.data.asks[0][0]);
-                    const midPrice = (bestBid + bestAsk) / 2;
-
-                    lobRes.data.bids.forEach(l => {
-                        const price = parseFloat(l[0]);
-                        const vol = parseFloat(l[1]);
-                        const distance = Math.max(Math.abs(midPrice - price) / midPrice, 0.0001);
-                        bV += vol * (1 / distance);
-                    });
-                    lobRes.data.asks.forEach(l => {
-                        const price = parseFloat(l[0]);
-                        const vol = parseFloat(l[1]);
-                        const distance = Math.max(Math.abs(midPrice - price) / midPrice, 0.0001);
-                        aV += vol * (1 / distance);
-                    });
+                if(lobRes.data.bids && lobRes.data.asks && lobRes.data.bids.length > 0) {
+                    const midPrice = (parseFloat(lobRes.data.bids[0][0]) + parseFloat(lobRes.data.asks[0][0])) / 2;
+                    lobRes.data.bids.forEach(l => { const price = parseFloat(l[0]); bV += parseFloat(l[1]) * (1 / Math.max(Math.abs(midPrice - price) / midPrice, 0.0001)); });
+                    lobRes.data.asks.forEach(l => { const price = parseFloat(l[0]); aV += parseFloat(l[1]) * (1 / Math.max(Math.abs(midPrice - price) / midPrice, 0.0001)); });
                     if (bV + aV > 0) obi = (bV - aV) / (bV + aV);
                 }
             } catch(e) {}
@@ -568,7 +550,7 @@ async function globalScan(scanType = 'auto') {
                 const res = runAnalysisElite(item.aggregate > 1 ? aggregateCandles(historical, item.aggregate) : historical);
                 if (res) validSignals.push({ assetId: asset.id, symbolBinance: asset.symbolBinance, tf: item.tf, analysis: res, obi, macro: { h1: s1h, h4: s4h } });
             }
-        } catch(e) { console.error(`Error escaneando ${asset.id}`); }
+        } catch(e) {}
     } 
 
     const consensusSignals = [];
@@ -578,9 +560,7 @@ async function globalScan(scanType = 'auto') {
         const passMacro = !(isB && s.macro.h4 === -1) && !(!isB && s.macro.h4 === 1);
         
         const historicalForAsset = candlesByAsset[s.assetId];
-        let momentumSlope = 0;
-        let nearResistance = false;
-        let nearSupport = false;
+        let momentumSlope = 0, nearResistance = false, nearSupport = false;
 
         if (historicalForAsset && historicalForAsset.length >= 10) {
             const recent10 = historicalForAsset.slice(-10).map(c => c.c);
@@ -591,231 +571,149 @@ async function globalScan(scanType = 'auto') {
 
         if (historicalForAsset && historicalForAsset.length >= 50) {
             const recent50 = historicalForAsset.slice(-50);
-            const highs = recent50.map(c => c.h);
-            const lows = recent50.map(c => c.l);
-            const highestHigh = Math.max(...highs);
-            const lowestLow = Math.min(...lows);
-            const currentPrice = historicalForAsset[historicalForAsset.length - 1].c;
+            const highestHigh = Math.max(...recent50.map(c => c.h));
+            const lowestLow = Math.min(...recent50.map(c => c.l));
             const avgRange = recent50.slice(-10).reduce((acc, c) => acc + (c.h - c.l), 0) / 10;
-            nearResistance = Math.abs(highestHigh - currentPrice) < avgRange;
-            nearSupport = Math.abs(currentPrice - lowestLow) < avgRange;
+            nearResistance = Math.abs(highestHigh - s.analysis.currentPrice) < avgRange;
+            nearSupport = Math.abs(s.analysis.currentPrice - lowestLow) < avgRange;
         }
 
-        s.momentumSlope = momentumSlope;
-        s.nearResistance = nearResistance;
-        s.nearSupport = nearSupport;
-        s.passMacro = passMacro;
+        const regime = detectRegime(historicalForAsset);
+        let passRegime = true;
+        if (regime === "TREND" && ((isB && momentumSlope < 0) || (!isB && momentumSlope > 0))) passRegime = false;
+        if (regime === "COMPRESSION" && s.analysis.absEdge < 4) passRegime = false;
+        if (regime === "RANGE" && ((isB && nearResistance) || (!isB && nearSupport))) passRegime = false;
 
-        const lastTradesAsset = parsedData.filter(r => r.Activo === s.assetId).slice(-5);
-        const recentLossesAsset = lastTradesAsset.filter(r => r.Veredicto === 'PERDIDA').length;
-
-        // --- 🟢 EVALUACIÓN ELITE ---
-        let isElite = true;
-        if (!passMacro) isElite = false;
-        if (s.analysis.cwev < 1.2) isElite = false;
-        if (recentLossesAsset >= 3) isElite = false;
-        if (isB && momentumSlope < 0) isElite = false;
-        if (!isB && momentumSlope > 0) isElite = false;
-        if (isB && nearResistance) isElite = false; 
-        if (!isB && nearSupport) isElite = false; 
-        if (s.analysis.prob < PROB_THRESHOLD) isElite = false;
-        if (s.analysis.acs < 0.015) isElite = false;
-        if (s.analysis.stability < 0.40) isElite = false;
-        if (s.analysis.n < 15) isElite = false;
-        if (!((isB && s.obi > 0) || (!isB && s.obi < 0))) isElite = false;
-        if (!statisticalStrength(s.analysis.n, s.analysis.acs, s.analysis.prob)) isElite = false;
-
-        // --- 🟡 EVALUACIÓN AGRESIVA ---
-        let isAggressive = true;
-        if (!passMacro) isAggressive = false; 
-        if (s.analysis.prob < 54) isAggressive = false; 
-        if (s.analysis.stability < 0.35) isAggressive = false; 
-        if (s.analysis.n < 12) isAggressive = false; 
+        const currentProbThreshold = getDynamicThreshold(s.analysis.currentATR, s.analysis.currentPrice);
+        const finalScore = calculateFinalScore(s.analysis, s.assetId);
         
-        let passMomentumAgr = true;
-        if (isB && momentumSlope < -0.0001) passMomentumAgr = false;
-        if (!isB && momentumSlope > 0.0001) passMomentumAgr = false;
-        if (!passMomentumAgr) isAggressive = false;
+        const isStrictLOB = ASSET_PROFILES[s.assetId] ? ASSET_PROFILES[s.assetId].strictLOB : false;
+        const lobPass = isStrictLOB ? ((isB && s.obi > 0.05) || (!isB && s.obi < -0.05)) : true;
+
+        const passFinalScore = finalScore >= 0.15;
+        const recentLossesAsset = parsedData.filter(r => r.Activo === s.assetId).slice(-5).filter(r => r.Veredicto.includes('PERDIDA')).length;
+
+        let isElite = passRegime && passFinalScore && passMacro && s.analysis.cwev >= 1.2 && recentLossesAsset < 3 && s.analysis.prob >= currentProbThreshold && s.analysis.stability >= 0.40 && lobPass && statisticalStrength(s.analysis.n, s.analysis.acs, s.analysis.prob);
+        let isAggressive = passMacro && s.analysis.prob >= (currentProbThreshold - 2) && s.analysis.stability >= 0.35 && !((isB && momentumSlope < -0.0001) || (!isB && momentumSlope > 0.0001));
 
         if (isElite || isAggressive) {
-            s.isElite = isElite;
-            s.isAggressive = isAggressive;
+            s.isElite = isElite; s.isAggressive = isAggressive; s.momentumSlope = momentumSlope; 
+            s.nearResistance = nearResistance; s.nearSupport = nearSupport; s.passMacro = passMacro; 
+            s.finalScore = finalScore;
             consensusSignals.push(s);
         }
     }
     
     consensusSignals.sort((a,b) => b.analysis.cwev - a.analysis.cwev);
 
-    const endTime = getLocalTime();
-    if (consensusSignals.length > 0) {
-        if (statusMsg) {
-            bot.editMessageText(`✅ *Scan TACTICAL completado*\n⏹️ *Fin:* ${endTime}\n🚀 *${consensusSignals.length} oportunidades detectadas.*`, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown' }).catch(()=>{});
-        }
+    if (statusMsg) bot.editMessageText(`✅ *Scan completado*\n🚀 *${consensusSignals.length} oportunidades.*`, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown' }).catch(()=>{});
 
+    if (consensusSignals.length > 0) {
+        lastSignalTime = Date.now();
+        
         for (const s of consensusSignals) {
             const sigId = `sig_${signalCounter++}`;
             SIGNAL_CACHE.set(sigId, s);
-            const icon = s.analysis.direction === 'BUY' ? '🟢' : '🔴';
-            const timeData = getRecommendedTimeData(s.tf, currentServerTime);
-            const edgeSign = s.analysis.edge > 0 ? '+' : '';
             
-            // --- 🎨 INTERFAZ VISUAL TÁCTICA ---
-            const eliteCheck = s.isElite ? '✅' : '❌';
-            const agrCheck = s.isAggressive ? '✅' : '❌';
-
             const dualScore = (s.isElite ? 0.6 : 0) + (s.isAggressive ? 0.4 : 0);
-            let scoreVisual = "";
-            let timingGap = "";
-            let modeString = "";
-
-            if (dualScore === 1.0) {
-                modeString = "ELITE+AGRESIVO";
-                scoreVisual = "1.0 → PERFECTO";
-                timingGap = "ELITE: Confirmado\nAGRESIVO: Confirmado\n🔥 Sincronización perfecta. Tendencia confirmada con inercia.";
-            } else if (dualScore === 0.6) {
-                modeString = "ELITE";
-                scoreVisual = "0.6 → SOLO ELITE";
-                timingGap = "ELITE: Confirmación tardía\nAGRESIVO: ❌ Falta inercia temprana\n⚠️ Setup seguro pero posiblemente atrasado.";
-            } else if (dualScore === 0.4) {
-                modeString = "AGRESIVO";
-                scoreVisual = "0.4 → SOLO AGRESIVO";
-                timingGap = "ELITE: ❌ Sin confirmación de contexto\nAGRESIVO: Entrada anticipada\n⚠️ Gap de timing detectado (Entrada temprana, bajar stake).";
-            }
-
+            let scoreVisual = dualScore === 1.0 ? "1.0 → PERFECTO" : dualScore === 0.6 ? "0.6 → SOLO ELITE" : "0.4 → SOLO AGRESIVO";
+            
             const confBar = makeProgressBar(s.analysis.prob); 
             const anticipationLevel = s.isAggressive ? 90 : 30;
             const antBar = makeProgressBar(anticipationLevel);
 
-            const isB = s.analysis.direction === 'BUY';
-            const momentumAlineado = (isB && s.momentumSlope > 0) || (!isB && s.momentumSlope < 0) ? 'A favor ✅' : 'En contra/Débil ⚠️';
-            const liquidez = (s.nearResistance || s.nearSupport) ? 'Zona de choque ⚠️' : 'Neutra / Limpia ✅';
-            const macroVal = s.passMacro ? 'OK ✅' : 'Contra tendencia ⚠️';
+            // 🎯 TARJETA VISUAL LIMPIA
+            const msgText = `🎯 *${s.assetId} | ${s.tf}*\n🧠 *MODO DUAL*\n🟢 ELITE    → ${s.isElite ? '✅' : '❌'}\n🟡 AGRESIVO → ${s.isAggressive ? '✅' : '❌'}\n\n🏆 *DUAL SCORE:* ${scoreVisual}\n📈 *Dirección:* ${s.analysis.direction}\n\n⚖️ *BALANCE*\nConfianza:    ${confBar} (${s.analysis.prob.toFixed(0)}%)\nAnticipación: ${antBar} (${anticipationLevel}%)\n\n*(Presioná el botón de abajo para el análisis IA y Setup de Trading)*`;
 
-            const msgText = `🎯 *${s.assetId} | ${s.tf}*
-
-🧠 *MODO DUAL*
-🟢 ELITE      → ${eliteCheck}
-🟡 AGRESIVO   → ${agrCheck}
-
-🏆 *DUAL SCORE:* ${scoreVisual}
-
-📈 *Dirección:* ${icon} *${s.analysis.direction}*
-🎯 *Probabilidad:* ${s.analysis.prob.toFixed(1)}%
-⚡ *Edge:* ${edgeSign}${s.analysis.edge.toFixed(2)}%
-
-🧬 *Contexto:*
-• Momentum: ${momentumAlineado}
-• Macro H4: ${macroVal}
-• Liquidez: ${liquidez}
-
-⏱️ *Ventana:* ${timeData.text}
-
-🧠 *DIFERENCIA ENTRE MODOS*
-${timingGap}
-
-⚖️ *BALANCE*
-Confianza:    ${confBar} (${s.analysis.prob.toFixed(0)}%)
-Anticipación: ${antBar} (${anticipationLevel}%)
-
-⏳ _Analizando contexto con Gemini AI..._`;
-
-            const sentMsg = await bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' });
-
-            let iaVerdictText = "PASS"; 
-            let iaScore = 0;
-            let iaContextText = "UNKNOWN";
-            let iaReasoning = "Error al consultar la IA.";
-            let tradingModuleText = "";
-            
-            const promptText = `Eres un Quant Trader Institucional. Tu tarea es doble: decidir el SCORE de ejecución y CLASIFICAR el contexto de mercado.
-            MODO DE LA SEÑAL: ${modeString} (Dual Score: ${dualScore.toFixed(1)}).
-            
-            DATOS:
-            Activo: ${s.assetId} | Timeframe: ${s.tf} | Dir: ${s.analysis.direction} | Prob: ${s.analysis.prob.toFixed(1)}% | Edge Real: ${s.analysis.edge.toFixed(2)}%
-            Stability: ${(s.analysis.stability * 100).toFixed(0)}% | LOB Ponderado: ${s.obi.toFixed(3)} | Momentum: ${s.momentumSlope.toFixed(4)} | Macro 4H: ${s.macro.h4}
-            
-            REGLAS:
-            1. Define el TRADE_CONTEXT basado en el Momentum y Macro H4:
-               - CONTINUATION: El Momentum y la Macro están a favor de la dirección.
-               - REVERSAL: Entrando en contra de la Macro pero el Momentum reciente es fuerte a favor.
-               - TRAP: Divergencia peligrosa, baja probabilidad, o choque de liquidez.
-            2. Define el AI_SCORE (0 a 100): Evalúa qué tan buena es la oportunidad basándote en el Edge, el LOB, el modo táctico y el contexto. >65 significa EXECUTE.
-            
-            Responde EXCLUSIVAMENTE en este formato exacto, respetando las mayúsculas:
-            AI_SCORE: (Número del 0 al 100)
-            TRADE_CONTEXT: (CONTINUATION, REVERSAL, o TRAP)
-            REASONING: (Tu argumento táctico en 2 oraciones).`;
-
-            try {
-                const apiKey = process.env.GEMINI_API_KEY;
-                const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
-                const result = await axios.post(url, { contents: [{ parts: [{ text: promptText }] }], generationConfig: { temperature: 0.2 } });
-                const text = result.data.candidates[0].content.parts[0].text;
-                
-                const scoreMatch = text.match(/AI_SCORE:\s*(\d+)/i);
-                iaScore = scoreMatch ? parseInt(scoreMatch[1]) : 0;
-                
-                const contextMatch = text.match(/TRADE_CONTEXT:\s*(CONTINUATION|REVERSAL|TRAP)/i);
-                iaContextText = contextMatch ? contextMatch[1].toUpperCase() : 'UNKNOWN';
-                
-                const reasonMatch = text.match(/REASONING:\s*([\s\S]*?)$/i);
-                iaReasoning = reasonMatch ? reasonMatch[1].trim().replace(/[*_[\]]/g, '') : 'Análisis completado.';
-                
-                const isExecute = iaScore >= 65;
-                const verdictIcon = isExecute ? '🚀 *EXECUTE TRADE*' : '⛔ *PASS*';
-                iaVerdictText = isExecute ? "EXECUTE" : "PASS";
-
-                // 🟢 MÓDULO DE TRADING SPOT SI LA IA LO APRUEBA Y ES DE CALIDAD
-                if (isExecute && iaContextText !== "TRAP") {
-                    const tradeData = calculateTradeLevels(s.analysis.currentPrice, s.analysis.direction, s.analysis.currentATR, s.analysis.edge, iaContextText, circuitBreakerLevel);
-                    if (tradeData) {
-                        tradingModuleText = `\n\n💰 *MODO TRADING (Spot/CFD x20)*\n📍 *Entry:* ${tradeData.entry}\n🛑 *Stop Loss:* ${tradeData.sl}\n🎯 *Take Profit:* ${tradeData.tp}\n⚖️ *R:R:* 1:${tradeData.rr}\n\n💼 *Volumen sugerido:* ${tradeData.positionSize} USDT\n📉 *Riesgo:* ${tradeData.riskPercent}% del capital`;
-                    }
+            const inlineKeyboard = {
+                reply_markup: {
+                    inline_keyboard: [[ { text: "🧠 Solicitar Análisis IA & Trading", callback_data: `ia_${sigId}` } ]]
                 }
+            };
 
-                const updatedMsg = msgText.replace('⏳ _Analizando contexto con Gemini AI..._', `*Veredicto IA:* ${verdictIcon} (Score: ${iaScore}/100)\n*Contexto IA:* 🧩 ${iaContextText}\n_📝 ${iaReasoning}_${tradingModuleText}`);
-                bot.editMessageText(updatedMsg, { chat_id: chatId, message_id: sentMsg.message_id, parse_mode: 'Markdown' });
+            const sentMsg = await bot.sendMessage(chatId, msgText, inlineKeyboard);
 
-            } catch (e) {
-                bot.editMessageText(msgText.replace('⏳ _Analizando contexto con Gemini AI..._', '❌ _Fallo de conexión IA. Juzgar manualmente._'), { chat_id: chatId, message_id: sentMsg.message_id, parse_mode: 'Markdown' });
-            }
-            
-            logToCSV({
-                asset: s.assetId, tf: s.tf, dir: s.analysis.direction, prob: s.analysis.prob.toFixed(1),
-                lob: s.obi.toFixed(3), edge: s.analysis.edge.toFixed(2), alpha: s.analysis.acs.toFixed(3),
-                stab: (s.analysis.stability * 100).toFixed(0), cwev: s.analysis.cwev.toFixed(1),
-                samples: s.analysis.n, veredicto: 'PENDIENTE', iaVerdict: iaVerdictText, iaScore: iaScore, iaContext: iaContextText, mode: modeString
-            });
-
+            // Guardamos la señal como PENDIENTE de resolución para el Cron de Binance
+            const timeData = getRecommendedTimeData(s.tf, currentServerTime);
             PENDING_AUDITS.push({
                 sigId, assetId: s.assetId, symbolBinance: s.symbolBinance, tf: s.tf, direction: s.analysis.direction,
                 startTs: timeData.startTs, endTs: timeData.endTs, messageId: sentMsg.message_id, retries: 0,
                 logData: {
-                    prob: s.analysis.prob.toFixed(1), lob: s.obi.toFixed(3), 
-                    edge: s.analysis.edge.toFixed(2), alpha: s.analysis.acs.toFixed(3),
-                    stab: (s.analysis.stability * 100).toFixed(0), cwev: s.analysis.cwev.toFixed(1),
-                    samples: s.analysis.n, iaVerdict: iaVerdictText, iaScore: iaScore, iaContext: iaContextText, mode: modeString
+                    prob: s.analysis.prob.toFixed(1), lob: s.obi.toFixed(3), edge: s.analysis.edge.toFixed(2), 
+                    alpha: s.analysis.acs.toFixed(3), stab: (s.analysis.stability * 100).toFixed(0), cwev: s.analysis.cwev.toFixed(1),
+                    samples: s.analysis.n, iaVerdict: 'NO_SOLICITADO', iaScore: 0, iaContext: 'N/A', 
+                    mode: s.isElite ? 'ELITE' : 'AGRESIVO', finalScore: s.finalScore.toFixed(2)
                 }
             });
         }
-    } else if (statusMsg) {
-        bot.editMessageText(`💤 *Scan TACTICAL finalizado*\n⏹️ *Fin:* ${endTime}\n_Sin divergencias de consenso._`, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown' }).catch(()=>{});
     }
 }
 
-// === CRONES ===
-let lastScanMinute = -1;
-setInterval(() => {
-    const now = new Date(getSyncedTime());
-    const m = now.getMinutes();
-    const s = now.getSeconds();
-    // CRON en el segundo 15 usando tiempo sincronizado
-    if ((m % 5 === 3) && s === 15 && lastScanMinute !== m) {
-        lastScanMinute = m;
-        globalScan('auto');
+// === BOTÓN DE ANÁLISIS A DEMANDA (IA) ===
+bot.on('callback_query', async (query) => {
+    const action = query.data;
+    if (action.startsWith('ia_')) {
+        const sigId = action.split('_')[1];
+        const s = SIGNAL_CACHE.get(sigId);
+        if (!s) return bot.answerCallbackQuery(query.id, { text: "Señal expirada o no encontrada.", show_alert: true });
+
+        const loadingMsg = await bot.sendMessage(chatId, '⏳ _Analizando contexto con Gemini AI..._', { parse_mode: 'Markdown' });
+        bot.answerCallbackQuery(query.id);
+
+        const assetPerf = assetPerformance[s.assetId] !== undefined ? `${(assetPerformance[s.assetId]*100).toFixed(0)}%` : 'N/A';
+        const aiPenalty = ASSET_PROFILES[s.assetId] ? ASSET_PROFILES[s.assetId].aiPenalty : 0;
+        
+        const promptText = `Eres un Quant Trader. AI_SCORE (0-100), TRADE_CONTEXT (CONTINUATION, REVERSAL, TRAP) y REASONING en 2 oraciones. 
+        Activo: ${s.assetId} | Dir: ${s.analysis.direction} | Prob: ${s.analysis.prob.toFixed(1)}% | Edge: ${s.analysis.absEdge.toFixed(2)}% | LOB: ${s.obi.toFixed(3)} | FinalScore: ${s.finalScore.toFixed(2)}.
+        NOTA DEL SISTEMA: El winrate histórico de este activo es ${assetPerf}. Aplica una penalización/bonificación de ${aiPenalty} puntos a tu evaluación de riesgo.`;
+
+        try {
+            const result = await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${process.env.GEMINI_API_KEY}`, { contents: [{ parts: [{ text: promptText }] }], generationConfig: { temperature: 0.2 } });
+            const text = result.data.candidates[0].content.parts[0].text;
+            
+            let iaScore = 0, iaCtx = "UNKNOWN", iaReason = "Analizado.";
+            const scoreMatch = text.match(/AI_SCORE:\s*(\d+)/i); if (scoreMatch) iaScore = parseInt(scoreMatch[1]) + aiPenalty; 
+            const ctxMatch = text.match(/TRADE_CONTEXT:\s*(\w+)/i); if (ctxMatch) iaCtx = ctxMatch[1].toUpperCase();
+            const reasonMatch = text.match(/REASONING:\s*([\s\S]*?)$/i); if (reasonMatch) iaReason = reasonMatch[1].trim();
+
+            let tradingModule = "";
+            if (iaScore >= MIN_AI_SCORE && iaCtx !== "TRAP") {
+                const trade = calculateTradeLevels(s.analysis.currentPrice, s.analysis.direction, s.analysis.currentATR, s.analysis.absEdge, iaCtx, circuitBreakerLevel, s.analysis.stability, iaScore);
+                const label = iaScore >= 72 ? "🟢 ELITE" : "🟡 OPORTUNIDAD";
+                tradingModule = `\n\n💰 *TRADING ${label}*\n📍 *Ent:* ${trade.entry} | 🛑 *SL:* ${trade.sl} | 🎯 *TP:* ${trade.tp}\n⚖️ *R:R:* 1:${trade.rr} | 💼 *Vol:* ${trade.positionSize} USDT\n📉 *Riesgo:* ${trade.riskPercent}%`;
+            }
+            
+            const responseText = `*Veredicto IA:* ${iaScore>=MIN_AI_SCORE?'🚀':'⛔'} (${iaScore}/100)\n*Contexto IA:* 🧩 ${iaCtx}\n_📝 ${iaReason}_${tradingModule}`;
+            bot.editMessageText(responseText, { chat_id: chatId, message_id: loadingMsg.message_id, parse_mode: 'Markdown' });
+            
+            // Actualizamos el objeto en PENDING_AUDITS para que cuando cierre la vela, guarde el veredicto de la IA en el CSV
+            const auditEntry = PENDING_AUDITS.find(a => a.sigId === sigId);
+            if (auditEntry) {
+                auditEntry.logData.iaVerdict = iaScore >= MIN_AI_SCORE ? 'EXECUTE' : 'PASS';
+                auditEntry.logData.iaScore = iaScore;
+                auditEntry.logData.iaContext = iaCtx;
+            }
+            
+        } catch (e) { bot.editMessageText('❌ _Error al contactar IA._', { chat_id: chatId, message_id: loadingMsg.message_id, parse_mode: 'Markdown' }); }
     }
+});
+
+// === CRONES DINÁMICOS ===
+setInterval(async () => { 
+    let volSum = 0, count = 0;
+    for (const candles of GLOBAL_CANDLE_CACHE.values()) {
+        const atrs = precalcATR(candles);
+        const atr = atrs[atrs.length - 1];
+        const price = candles[candles.length - 1].c;
+        if (atr && price) { volSum += atr / price; count++; }
+    }
+    const avgVol = count > 0 ? volSum / count : 0.002;
+    const targetSecond = getDynamicSecond(avgVol);
+    const now = new Date(getSyncedTime()); 
+    if ((now.getMinutes() % 5 === 3) && Math.abs(now.getSeconds() - targetSecond) <= 1) globalScan('auto'); 
 }, 1000);
 
+// 🚀 CRON DE AUDITORÍA RESTAURADO (Vital para aprender)
 setInterval(async () => {
     for (let i = PENDING_AUDITS.length - 1; i >= 0; i--) {
         const audit = PENDING_AUDITS[i];
@@ -839,6 +737,7 @@ setInterval(async () => {
                 const isTie = closePrice === openPrice;
                 const iconResult = isTie ? 'EMPATE' : (isWin ? 'GANADA' : 'PERDIDA');
 
+                // Enviamos el mensaje de la auditoría usando logData que puede tener info de IA o no
                 const auditMsg = `🔍 *AUDITORÍA FINAL (BINANCE)*\n\n*Activo:* ${audit.assetId}\n*Dirección:* ${audit.direction}\n*Modo:* ${audit.logData.mode}\n*Contexto IA:* ${audit.logData.iaContext}\n*Veredicto IA:* ${audit.logData.iaVerdict} (Score: ${audit.logData.iaScore})\n\n🟢 Open: ${openPrice.toFixed(4)}\n🔴 Close: ${closePrice.toFixed(4)}\n\n*Resultado:* ${iconResult}`;
                 await bot.sendMessage(chatId, auditMsg, { parse_mode: 'Markdown', reply_to_message_id: audit.messageId });
                 
@@ -846,7 +745,7 @@ setInterval(async () => {
                     asset: audit.assetId, tf: audit.tf, dir: audit.direction, 
                     prob: audit.logData.prob, lob: audit.logData.lob, edge: audit.logData.edge,
                     alpha: audit.logData.alpha, stab: audit.logData.stab, cwev: audit.logData.cwev,
-                    samples: audit.logData.samples, iaVerdict: audit.logData.iaVerdict, iaScore: audit.logData.iaScore, iaContext: audit.logData.iaContext, mode: audit.logData.mode,
+                    samples: audit.logData.samples, iaVerdict: audit.logData.iaVerdict, iaScore: audit.logData.iaScore, iaContext: audit.logData.iaContext, mode: audit.logData.mode, finalScore: audit.logData.finalScore,
                     veredicto: iconResult, open: openPrice, close: closePrice 
                 });
                 
