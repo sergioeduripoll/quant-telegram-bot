@@ -202,7 +202,6 @@ bot.on('callback_query', async (query) => {
     const data = query.data;
     if (!data.startsWith('analyze_')) return;
 
-    // Corrección para no romper los IDs con guiones bajos múltiples (ej: sig_0)
     const sigId = data.replace('analyze_', ''); 
     const s = SIGNAL_CACHE.get(sigId);
 
@@ -210,7 +209,6 @@ bot.on('callback_query', async (query) => {
         return bot.answerCallbackQuery(query.id, { text: "⏳ La señal expiró o ya no está en caché.", show_alert: true });
     }
 
-    // Control para evitar doble ejecución de la IA en la misma señal
     if (s.aiProcessed) {
         return bot.answerCallbackQuery(query.id, {
             text: "⚠️ La IA ya fue ejecutada en esta señal.",
@@ -278,7 +276,6 @@ bot.on('callback_query', async (query) => {
         const updatedMsg = s.msgText.replace('⏳ _Esperando orden para análisis IA..._', `*Veredicto IA:* ${verdictIcon} (Score: ${iaScore}/100)\n*Contexto IA:* 🧩 ${iaContextText}\n_📝 ${iaReasoning}_${tradingModuleText}`);
         await bot.editMessageText(updatedMsg, { chat_id: chatId, message_id: query.message.message_id, parse_mode: 'Markdown' });
 
-        // Inyectamos los resultados de la IA en la auditoría pendiente
         const auditEntry = PENDING_AUDITS.find(a => a.sigId === sigId);
         if (auditEntry) {
             auditEntry.logData.iaVerdict = iaVerdictText;
@@ -287,7 +284,7 @@ bot.on('callback_query', async (query) => {
         }
 
     } catch (e) {
-        s.aiProcessed = false; // Permitimos volver a tocar el botón si la API falló
+        s.aiProcessed = false; 
         await bot.editMessageText(s.msgText.replace('⏳ _Esperando orden para análisis IA..._', '❌ _Fallo de conexión IA. Intenta de nuevo._'), { 
             chat_id: chatId, 
             message_id: query.message.message_id, 
@@ -844,8 +841,15 @@ Anticipación: ${antBar} (${anticipationLevel}%)
             });
             
             PENDING_AUDITS.push({
-                sigId, assetId: s.assetId, symbolBinance: s.symbolBinance, tf: s.tf, direction: s.analysis.direction,
-                startTs: timeData.startTs, endTs: timeData.endTs, messageId: sentMsg.message_id, retries: 0,
+                sigId: sigId, 
+                assetId: s.assetId, 
+                symbolBinance: s.symbolBinance, 
+                tf: s.tf, 
+                direction: s.analysis.direction,
+                openPrice: s.analysis.currentPrice,
+                closeTime: timeData.endTs,
+                messageId: sentMsg.message_id, 
+                retries: 0,
                 logData: {
                     prob: s.analysis.prob.toFixed(1), lob: s.obi.toFixed(3), 
                     edge: s.analysis.edge.toFixed(2), alpha: s.analysis.acs.toFixed(3),
@@ -872,45 +876,47 @@ setInterval(() => {
 }, 1000);
 
 setInterval(async () => {
+    const now = getSyncedTime();
+    
     for (let i = PENDING_AUDITS.length - 1; i >= 0; i--) {
         const audit = PENDING_AUDITS[i];
-        const currentServerTime = getSyncedTime(); 
-        if (currentServerTime >= audit.endTs + 10000) {
+        
+        if (now >= audit.closeTime) {
             try {
-                const binanceInterval = audit.tf.toLowerCase();
-                const res = await axios.get(`${CONFIG.BINANCE_API}/klines?symbol=${audit.symbolBinance}&interval=${binanceInterval}&limit=3`);
-                const klines = res.data;
-                const tradeCandle = klines.find(kline => kline[0] === audit.startTs);
+                const res = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${audit.symbolBinance}&limit=5`);
+                const candles = res.data;
+                
+                if (!candles || candles.length < 2) continue; 
 
-                if (!tradeCandle) {
-                    audit.retries++;
-                    if (audit.retries > 5) PENDING_AUDITS.splice(i, 1); 
-                    continue;
+                const closedCandle = candles[candles.length - 2]; 
+                const closePrice = closedCandle.c;
+                const openPrice = audit.openPrice;
+
+                let isWin = false;
+                if (audit.direction === 'BUY') {
+                    isWin = closePrice > openPrice;
+                } else if (audit.direction === 'SELL') {
+                    isWin = closePrice < openPrice;
                 }
+                
+                const iconResult = (closePrice === openPrice) ? 'EMPATE' : (isWin ? 'GANADA' : 'PERDIDA');
 
-                const openPrice = parseFloat(tradeCandle[1]);
-                const closePrice = parseFloat(tradeCandle[4]);
-                let isWin = (audit.direction === 'BUY' && closePrice > openPrice) || (audit.direction === 'SELL' && closePrice < openPrice);
-                const isTie = closePrice === openPrice;
-                const iconResult = isTie ? 'EMPATE' : (isWin ? 'GANADA' : 'PERDIDA');
+                audit.logData.asset = audit.assetId;
+                audit.logData.tf = audit.tf;
+                audit.logData.dir = audit.direction;
+                audit.logData.veredicto = iconResult;
+                audit.logData.open = openPrice;
+                audit.logData.close = closePrice;
 
-                // Aseguramos que se guarde el log ANTES del mensaje a Telegram por si la API falla
-                logToCSV({ 
-                    asset: audit.assetId, tf: audit.tf, dir: audit.direction, 
-                    prob: audit.logData.prob, lob: audit.logData.lob, edge: audit.logData.edge,
-                    alpha: audit.logData.alpha, stab: audit.logData.stab, cwev: audit.logData.cwev,
-                    samples: audit.logData.samples, iaVerdict: audit.logData.iaVerdict, iaScore: audit.logData.iaScore, iaContext: audit.logData.iaContext, mode: audit.logData.mode,
-                    veredicto: iconResult, open: openPrice, close: closePrice 
-                });
+                logToCSV(audit.logData);
 
                 const auditMsg = `🔍 *AUDITORÍA FINAL (BINANCE)*\n\n*Activo:* ${audit.assetId}\n*Dirección:* ${audit.direction}\n*Modo:* ${audit.logData.mode}\n*Contexto IA:* ${audit.logData.iaContext}\n*Veredicto IA:* ${audit.logData.iaVerdict} (Score: ${audit.logData.iaScore})\n\n🟢 Open: ${openPrice.toFixed(4)}\n🔴 Close: ${closePrice.toFixed(4)}\n\n*Resultado:* ${iconResult}`;
                 await bot.sendMessage(chatId, auditMsg, { parse_mode: 'Markdown', reply_to_message_id: audit.messageId });
-                
+
                 PENDING_AUDITS.splice(i, 1);
-            } catch (error) { 
-                console.error("[SYS] Error procesando auditoría:", error.message);
-                audit.retries++; 
+            } catch (error) {
+                console.error("[SYS] Error procesando auditoría post-predicción:", error.message);
             }
         }
     }
-}, 15000);
+}, 10000);
