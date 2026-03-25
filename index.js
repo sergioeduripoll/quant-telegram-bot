@@ -184,7 +184,79 @@ bot.onText(/\/scan/, async (msg) => {
 });
 
 console.log(`🤖 Quant Sniper V12.5 TACTICAL PRO iniciando...`);
-bot.sendMessage(chatId, '🟢 *Quant Sniper V12.5 TACTICAL PRO* encendido.\nModo: Semáforo Visual + IA Contextual + Módulo Trading Spot', { parse_mode: 'Markdown' });
+bot.sendMessage(chatId, '🟢 *Quant Sniper V12.5 TACTICAL PRO* encendido.\nModo: Semáforo Visual + IA Manual + Módulo Trading Spot', { parse_mode: 'Markdown' });
+
+// === MÓDULO DE IA MANUAL A DEMANDA ===
+bot.on('callback_query', async (query) => {
+    if (query.data.startsWith('ai_')) {
+        const sigId = query.data.replace('ai_', '');
+        const cacheData = SIGNAL_CACHE.get(sigId);
+
+        if (!cacheData) {
+            bot.answerCallbackQuery(query.id, { text: "Señal expirada en caché.", show_alert: true });
+            return;
+        }
+
+        bot.answerCallbackQuery(query.id, { text: "Consultando a Gemini AI..." });
+
+        const { s, msgText, modeString, dualScore } = cacheData;
+        const loadingMsg = msgText + `\n\n⏳ _Analizando contexto con Gemini AI..._`;
+        await bot.editMessageText(loadingMsg, { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: 'Markdown' }).catch(()=>{});
+
+        const promptText = `Eres un Quant Trader Institucional. Tu tarea es doble: decidir el SCORE de ejecución y CLASIFICAR el contexto de mercado.
+        MODO DE LA SEÑAL: ${modeString} (Dual Score: ${dualScore.toFixed(1)}).
+        
+        DATOS:
+        Activo: ${s.assetId} | Timeframe: ${s.tf} | Dir: ${s.analysis.direction} | Prob: ${s.analysis.prob.toFixed(1)}% | Edge Real: ${s.analysis.edge.toFixed(2)}%
+        Stability: ${(s.analysis.stability * 100).toFixed(0)}% | LOB Ponderado: ${s.obi.toFixed(3)} | Momentum: ${s.momentumSlope.toFixed(4)} | Macro 4H: ${s.macro.h4}
+        
+        REGLAS:
+        1. Define el TRADE_CONTEXT basado en el Momentum y Macro H4:
+           - CONTINUATION: El Momentum y la Macro están a favor de la dirección.
+           - REVERSAL: Entrando en contra de la Macro pero el Momentum reciente es fuerte a favor.
+           - TRAP: Divergencia peligrosa, baja probabilidad, o choque de liquidez.
+        2. Define el AI_SCORE (0 a 100): Evalúa qué tan buena es la oportunidad basándote en el Edge, el LOB, el modo táctico y el contexto. >65 significa EXECUTE.
+        
+        Responde EXCLUSIVAMENTE en este formato exacto, respetando las mayúsculas:
+        AI_SCORE: (Número del 0 al 100)
+        TRADE_CONTEXT: (CONTINUATION, REVERSAL, o TRAP)
+        REASONING: (Tu argumento táctico en 2 oraciones).`;
+
+        try {
+            const apiKey = process.env.GEMINI_API_KEY;
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
+            const result = await axios.post(url, { contents: [{ parts: [{ text: promptText }] }], generationConfig: { temperature: 0.2 } });
+            const text = result.data.candidates[0].content.parts[0].text;
+            
+            const scoreMatch = text.match(/AI_SCORE:\s*(\d+)/i);
+            const iaScore = scoreMatch ? parseInt(scoreMatch[1]) : 0;
+            
+            const contextMatch = text.match(/TRADE_CONTEXT:\s*(CONTINUATION|REVERSAL|TRAP)/i);
+            const iaContextText = contextMatch ? contextMatch[1].toUpperCase() : 'UNKNOWN';
+            
+            const reasonMatch = text.match(/REASONING:\s*([\s\S]*?)$/i);
+            const iaReasoning = reasonMatch ? reasonMatch[1].trim().replace(/[*_[\]]/g, '') : 'Análisis completado.';
+            
+            const isExecute = iaScore >= 65;
+            const verdictIcon = isExecute ? '🚀 *EXECUTE TRADE*' : '⛔ *PASS*';
+
+            let tradingModuleText = "";
+            if (isExecute && iaContextText !== "TRAP") {
+                const tradeData = calculateTradeLevels(s.analysis.currentPrice, s.analysis.direction, s.analysis.currentATR, s.analysis.edge, iaContextText, circuitBreakerLevel);
+                if (tradeData) {
+                    tradingModuleText = `\n\n💰 *MODO TRADING (Spot/CFD x20)*\n📍 *Entry:* ${tradeData.entry}\n🛑 *Stop Loss:* ${tradeData.sl}\n🎯 *Take Profit:* ${tradeData.tp}\n⚖️ *R:R:* 1:${tradeData.rr}\n\n💼 *Volumen sugerido:* ${tradeData.positionSize} USDT\n📉 *Riesgo:* ${tradeData.riskPercent}% del capital`;
+                }
+            }
+
+            const finalMsg = msgText + `\n\n*Veredicto IA:* ${verdictIcon} (Score: ${iaScore}/100)\n*Contexto IA:* 🧩 ${iaContextText}\n_📝 ${iaReasoning}_${tradingModuleText}`;
+            
+            bot.editMessageText(finalMsg, { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: 'Markdown' });
+
+        } catch (e) {
+            bot.editMessageText(msgText + '\n\n❌ _Fallo de conexión IA. Juzgar manualmente._', { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: 'Markdown' });
+        }
+    }
+});
 
 // === MOTOR CUANTITATIVO ===
 function calculateZScore(values) {
@@ -479,17 +551,18 @@ async function globalScan(scanType = 'auto') {
 
     const validSignals = [];
     
-    // --- LÓGICA DE TIMEFRAMES RESTRINGIDA ---
-    const now = new Date(getSyncedTime());
-    const currentMinute = now.getMinutes();
+    // --- LÓGICA DE TIMEFRAMES ---
+    let tfs = [{ tf: '5M', aggregate: 1 }]; 
 
-    let tfs = [{ tf: '5M', aggregate: 1 }]; // 5m siempre activo
-    
-    // 15m, 30m y 1h SOLO se activan cuando corresponden, sin importar modo auto o manual
-    if ([13, 14, 15, 28, 29, 30, 43, 44, 45, 58, 59, 0].includes(currentMinute)) tfs.push({ tf: '15M', aggregate: 3 });
-    if ([28, 29, 30, 58, 59, 0].includes(currentMinute)) tfs.push({ tf: '30M', aggregate: 6 });
-    if ([58, 59, 0].includes(currentMinute)) tfs.push({ tf: '1H', aggregate: 12 });
-    // ----------------------------------------
+    if (scanType === 'auto') {
+        const now = new Date(getSyncedTime());
+        const currentMinute = now.getMinutes();
+        if ([13, 14, 15, 28, 29, 30, 43, 44, 45, 58, 59, 0].includes(currentMinute)) tfs.push({ tf: '15M', aggregate: 3 });
+        if ([28, 29, 30, 58, 59, 0].includes(currentMinute)) tfs.push({ tf: '30M', aggregate: 6 });
+        if ([58, 59, 0].includes(currentMinute)) tfs.push({ tf: '1H', aggregate: 12 });
+    } else {
+        tfs = [{ tf: '5M', aggregate: 1 }, { tf: '15M', aggregate: 3 }, { tf: '30M', aggregate: 6 }, { tf: '1H', aggregate: 12 }];
+    }
 
     for (const asset of CONFIG.MARKETS) {
         if (!allowedAssets.includes(asset.id)) continue;
@@ -666,7 +739,6 @@ async function globalScan(scanType = 'auto') {
 
         for (const s of consensusSignals) {
             const sigId = `sig_${signalCounter++}`;
-            SIGNAL_CACHE.set(sigId, s);
             const icon = s.analysis.direction === 'BUY' ? '🟢' : '🔴';
             const timeData = getRecommendedTimeData(s.tf, currentServerTime);
             const edgeSign = s.analysis.edge > 0 ? '+' : '';
@@ -727,78 +799,29 @@ ${timingGap}
 
 ⚖️ *BALANCE*
 Confianza:    ${confBar} (${s.analysis.prob.toFixed(0)}%)
-Anticipación: ${antBar} (${anticipationLevel}%)
+Anticipación: ${antBar} (${anticipationLevel}%)`;
 
-⏳ _Analizando contexto con Gemini AI..._`;
+            // Creamos el botón interactivo
+            const inlineKeyboard = {
+                inline_keyboard: [[{ text: "🧠 Analizar Contexto con IA", callback_data: `ai_${sigId}` }]]
+            };
 
-            const sentMsg = await bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' });
+            const sentMsg = await bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown', reply_markup: inlineKeyboard });
 
-            let iaVerdictText = "PASS"; 
-            let iaScore = 0;
-            let iaContextText = "UNKNOWN";
-            let iaReasoning = "Error al consultar la IA.";
-            let tradingModuleText = "";
-            
-            const promptText = `Eres un Quant Trader Institucional. Tu tarea es doble: decidir el SCORE de ejecución y CLASIFICAR el contexto de mercado.
-            MODO DE LA SEÑAL: ${modeString} (Dual Score: ${dualScore.toFixed(1)}).
-            
-            DATOS:
-            Activo: ${s.assetId} | Timeframe: ${s.tf} | Dir: ${s.analysis.direction} | Prob: ${s.analysis.prob.toFixed(1)}% | Edge Real: ${s.analysis.edge.toFixed(2)}%
-            Stability: ${(s.analysis.stability * 100).toFixed(0)}% | LOB Ponderado: ${s.obi.toFixed(3)} | Momentum: ${s.momentumSlope.toFixed(4)} | Macro 4H: ${s.macro.h4}
-            
-            REGLAS:
-            1. Define el TRADE_CONTEXT basado en el Momentum y Macro H4:
-               - CONTINUATION: El Momentum y la Macro están a favor de la dirección.
-               - REVERSAL: Entrando en contra de la Macro pero el Momentum reciente es fuerte a favor.
-               - TRAP: Divergencia peligrosa, baja probabilidad, o choque de liquidez.
-            2. Define el AI_SCORE (0 a 100): Evalúa qué tan buena es la oportunidad basándote en el Edge, el LOB, el modo táctico y el contexto. >65 significa EXECUTE.
-            
-            Responde EXCLUSIVAMENTE en este formato exacto, respetando las mayúsculas:
-            AI_SCORE: (Número del 0 al 100)
-            TRADE_CONTEXT: (CONTINUATION, REVERSAL, o TRAP)
-            REASONING: (Tu argumento táctico en 2 oraciones).`;
+            // Guardamos en caché todo lo necesario por si presionas el botón después
+            SIGNAL_CACHE.set(sigId, { 
+                s, msgText, modeString, dualScore 
+            });
 
-            try {
-                const apiKey = process.env.GEMINI_API_KEY;
-                const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
-                const result = await axios.post(url, { contents: [{ parts: [{ text: promptText }] }], generationConfig: { temperature: 0.2 } });
-                const text = result.data.candidates[0].content.parts[0].text;
-                
-                const scoreMatch = text.match(/AI_SCORE:\s*(\d+)/i);
-                iaScore = scoreMatch ? parseInt(scoreMatch[1]) : 0;
-                
-                const contextMatch = text.match(/TRADE_CONTEXT:\s*(CONTINUATION|REVERSAL|TRAP)/i);
-                iaContextText = contextMatch ? contextMatch[1].toUpperCase() : 'UNKNOWN';
-                
-                const reasonMatch = text.match(/REASONING:\s*([\s\S]*?)$/i);
-                iaReasoning = reasonMatch ? reasonMatch[1].trim().replace(/[*_[\]]/g, '') : 'Análisis completado.';
-                
-                const isExecute = iaScore >= 65;
-                const verdictIcon = isExecute ? '🚀 *EXECUTE TRADE*' : '⛔ *PASS*';
-                iaVerdictText = isExecute ? "EXECUTE" : "PASS";
-
-                // 🟢 MÓDULO DE TRADING SPOT SI LA IA LO APRUEBA Y ES DE CALIDAD
-                if (isExecute && iaContextText !== "TRAP") {
-                    const tradeData = calculateTradeLevels(s.analysis.currentPrice, s.analysis.direction, s.analysis.currentATR, s.analysis.edge, iaContextText, circuitBreakerLevel);
-                    if (tradeData) {
-                        tradingModuleText = `\n\n💰 *MODO TRADING (Spot/CFD x20)*\n📍 *Entry:* ${tradeData.entry}\n🛑 *Stop Loss:* ${tradeData.sl}\n🎯 *Take Profit:* ${tradeData.tp}\n⚖️ *R:R:* 1:${tradeData.rr}\n\n💼 *Volumen sugerido:* ${tradeData.positionSize} USDT\n📉 *Riesgo:* ${tradeData.riskPercent}% del capital`;
-                    }
-                }
-
-                const updatedMsg = msgText.replace('⏳ _Analizando contexto con Gemini AI..._', `*Veredicto IA:* ${verdictIcon} (Score: ${iaScore}/100)\n*Contexto IA:* 🧩 ${iaContextText}\n_📝 ${iaReasoning}_${tradingModuleText}`);
-                bot.editMessageText(updatedMsg, { chat_id: chatId, message_id: sentMsg.message_id, parse_mode: 'Markdown' });
-
-            } catch (e) {
-                bot.editMessageText(msgText.replace('⏳ _Analizando contexto con Gemini AI..._', '❌ _Fallo de conexión IA. Juzgar manualmente._'), { chat_id: chatId, message_id: sentMsg.message_id, parse_mode: 'Markdown' });
-            }
-            
+            // Loggeamos al CSV inicial (Dejamos los campos de IA en blanco/cero)
             logToCSV({
                 asset: s.assetId, tf: s.tf, dir: s.analysis.direction, prob: s.analysis.prob.toFixed(1),
                 lob: s.obi.toFixed(3), edge: s.analysis.edge.toFixed(2), alpha: s.analysis.acs.toFixed(3),
                 stab: (s.analysis.stability * 100).toFixed(0), cwev: s.analysis.cwev.toFixed(1),
-                samples: s.analysis.n, veredicto: 'PENDIENTE', iaVerdict: iaVerdictText, iaScore: iaScore, iaContext: iaContextText, mode: modeString
+                samples: s.analysis.n, veredicto: 'PENDIENTE', iaVerdict: '-', iaScore: 0, iaContext: '-', mode: modeString
             });
 
+            // Auditoría pura del algoritmo (Sin datos de IA)
             PENDING_AUDITS.push({
                 sigId, assetId: s.assetId, symbolBinance: s.symbolBinance, tf: s.tf, direction: s.analysis.direction,
                 startTs: timeData.startTs, endTs: timeData.endTs, messageId: sentMsg.message_id, retries: 0,
@@ -806,7 +829,7 @@ Anticipación: ${antBar} (${anticipationLevel}%)
                     prob: s.analysis.prob.toFixed(1), lob: s.obi.toFixed(3), 
                     edge: s.analysis.edge.toFixed(2), alpha: s.analysis.acs.toFixed(3),
                     stab: (s.analysis.stability * 100).toFixed(0), cwev: s.analysis.cwev.toFixed(1),
-                    samples: s.analysis.n, iaVerdict: iaVerdictText, iaScore: iaScore, iaContext: iaContextText, mode: modeString
+                    samples: s.analysis.n, mode: modeString
                 }
             });
         }
@@ -851,14 +874,16 @@ setInterval(async () => {
                 const isTie = closePrice === openPrice;
                 const iconResult = isTie ? 'EMPATE' : (isWin ? 'GANADA' : 'PERDIDA');
 
-                const auditMsg = `🔍 *AUDITORÍA FINAL (BINANCE)*\n\n*Activo:* ${audit.assetId}\n*Dirección:* ${audit.direction}\n*Modo:* ${audit.logData.mode}\n*Contexto IA:* ${audit.logData.iaContext}\n*Veredicto IA:* ${audit.logData.iaVerdict} (Score: ${audit.logData.iaScore})\n\n🟢 Open: ${openPrice.toFixed(4)}\n🔴 Close: ${closePrice.toFixed(4)}\n\n*Resultado:* ${iconResult}`;
+                // Mensaje limpio, solo datos cuantitativos
+                const auditMsg = `🔍 *AUDITORÍA FINAL (BINANCE)*\n\n*Activo:* ${audit.assetId}\n*Dirección:* ${audit.direction}\n*Modo:* ${audit.logData.mode}\n\n🟢 Open: ${openPrice.toFixed(4)}\n🔴 Close: ${closePrice.toFixed(4)}\n\n*Resultado:* ${iconResult}`;
                 await bot.sendMessage(chatId, auditMsg, { parse_mode: 'Markdown', reply_to_message_id: audit.messageId });
                 
+                // Mantenemos la estructura del CSV rellenando la IA con guiones/ceros para no desfasar columnas
                 logToCSV({ 
                     asset: audit.assetId, tf: audit.tf, dir: audit.direction, 
                     prob: audit.logData.prob, lob: audit.logData.lob, edge: audit.logData.edge,
                     alpha: audit.logData.alpha, stab: audit.logData.stab, cwev: audit.logData.cwev,
-                    samples: audit.logData.samples, iaVerdict: audit.logData.iaVerdict, iaScore: audit.logData.iaScore, iaContext: audit.logData.iaContext, mode: audit.logData.mode,
+                    samples: audit.logData.samples, iaVerdict: '-', iaScore: 0, iaContext: '-', mode: audit.logData.mode,
                     veredicto: iconResult, open: openPrice, close: closePrice 
                 });
                 
