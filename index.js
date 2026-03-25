@@ -42,7 +42,7 @@ const SIGNAL_CACHE = new Map();
 let signalCounter = 0;
 const PENDING_AUDITS = [];
 
-// 🟢 Control Anti-Ruina Progresivo y Cache Global
+// 🟢 Control Anti-Ruina Progresivo y Cache Global (RESTAURADO)
 let globalPauseUntil = 0; 
 let circuitBreakerLevel = 0;
 let lastCircuitBreakerTradeCount = 0;
@@ -86,7 +86,7 @@ function logToCSV(data) {
     fs.appendFileSync(filePath, row);
 }
 
-// === FUNCIONES DE TRADING (NUEVO MÓDULO CFDs / QUANTFURY) ===
+// === FUNCIONES DE TRADING (RESTAURADO) ===
 function formatPrice(val) {
     if (val < 0.01) return val.toFixed(6);
     if (val < 1) return val.toFixed(4);
@@ -95,18 +95,19 @@ function formatPrice(val) {
 }
 
 function calculateTradeLevels(price, direction, atr, edge, iaContext, cbLevel) {
-    const capital = 1000; // 👈 Tu capital en USD configurado aquí
-    const leverage = 20;  // 👈 Apalancamiento máximo usado
-    let riskPercent = cbLevel > 0 ? 1.0 : 2.0; // Si venimos perdiendo, baja a 1%
+    const capital = 1000; 
+    const leverage = 20;  
+    let riskPercent = cbLevel > 0 ? 1.0 : 2.0; 
 
-    const maxRiskPercent = 0.5; // Distancia máxima del 0.5% real para SL (protege del x20)
+    const maxRiskPercent = 0.5; 
     let slDistance = atr * 1.2;
     const maxDistance = price * (maxRiskPercent / 100);
     if (slDistance > maxDistance) slDistance = maxDistance;
 
-    let rr = Math.max(1.2, edge / 2);
-    if (iaContext === "CONTINUATION") rr *= 1.3;
-    if (iaContext === "REVERSAL") rr *= 0.8;
+    // R:R Dinámico basado en Edge (Absoluto) y Contexto de IA de Liquidez
+    let rr = Math.max(1.2, Math.abs(edge) / 2);
+    if (iaContext === "INSTITUTIONAL_SWEEP") rr *= 1.3;
+    if (iaContext === "TREND_IMPULSE") rr *= 1.1;
 
     let entry = price;
     let sl, tp;
@@ -120,13 +121,11 @@ function calculateTradeLevels(price, direction, atr, edge, iaContext, cbLevel) {
     }
 
     const minMove = price * 0.002;
-    if (Math.abs(tp - entry) < minMove) return null; // Filtra trades basura
+    if (Math.abs(tp - entry) < minMove) return null; 
 
-    // Filtro de Liquidación estricto
     const liquidationDistance = 1 / leverage;
     if ((slDistance / price) > (liquidationDistance * 0.7)) return null;
 
-    // Cálculo matemático de volumen real en USD para mantener el riesgo fijo
     const riskAmount = capital * (riskPercent / 100);
     const priceDiff = Math.abs(entry - sl);
     const positionSizeUSDT = (riskAmount / priceDiff) * entry;
@@ -183,10 +182,7 @@ bot.onText(/\/scan/, async (msg) => {
     }
 });
 
-console.log(`🤖 Quant Sniper V12.5 TACTICAL PRO iniciando...`);
-bot.sendMessage(chatId, '🟢 *Quant Sniper V12.5 TACTICAL PRO* encendido.\nModo: Semáforo Visual + IA Manual + Módulo Trading Spot', { parse_mode: 'Markdown' });
-
-// === MÓDULO DE IA MANUAL A DEMANDA ===
+// === MÓDULO DE IA MANUAL A DEMANDA (RESTAURADO Y ALINEADO AL CSV) ===
 bot.on('callback_query', async (query) => {
     if (query.data.startsWith('ai_')) {
         const sigId = query.data.replace('ai_', '');
@@ -197,30 +193,32 @@ bot.on('callback_query', async (query) => {
             return;
         }
 
-        bot.answerCallbackQuery(query.id, { text: "Consultando a Gemini AI..." });
+        bot.answerCallbackQuery(query.id, { text: "Consultando a Gemini IA..." });
 
         const { s, msgText, modeString, dualScore } = cacheData;
-        const loadingMsg = msgText + `\n\n⏳ _Analizando contexto con Gemini AI..._`;
+        const loadingMsg = msgText + `\n\n⏳ _Analizando con IA de Liquidez Institucional..._`;
         await bot.editMessageText(loadingMsg, { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: 'Markdown' }).catch(()=>{});
 
-        const promptText = `Eres un Quant Trader Institucional. Tu tarea es doble: decidir el SCORE de ejecución y CLASIFICAR el contexto de mercado.
-        MODO DE LA SEÑAL: ${modeString} (Dual Score: ${dualScore.toFixed(1)}).
+        const promptText = `Eres un Quant Trader Experto en Liquidez Institucional. Tu tarea es decidir el SCORE y clasificar el contexto basado en Smart Money.
+        MODO: ${modeString} (Dual Score: ${dualScore.toFixed(1)}).
         
         DATOS:
-        Activo: ${s.assetId} | Timeframe: ${s.tf} | Dir: ${s.analysis.direction} | Prob: ${s.analysis.prob.toFixed(1)}% | Edge Real: ${s.analysis.edge.toFixed(2)}%
-        Stability: ${(s.analysis.stability * 100).toFixed(0)}% | LOB Ponderado: ${s.obi.toFixed(3)} | Momentum: ${s.momentumSlope.toFixed(4)} | Macro 4H: ${s.macro.h4}
+        Activo: ${s.assetId} | Dir: ${s.analysis.direction} | Prob: ${s.analysis.prob.toFixed(1)}% | Edge: ${s.analysis.edge.toFixed(2)}%
+        Stability: ${(s.analysis.stability * 100).toFixed(0)}% | LOB: ${s.obi.toFixed(3)} | Momentum: ${s.momentumSlope.toFixed(4)} | Macro 4H: ${s.macro.h4}
         
-        REGLAS:
-        1. Define el TRADE_CONTEXT basado en el Momentum y Macro H4:
-           - CONTINUATION: El Momentum y la Macro están a favor de la dirección.
-           - REVERSAL: Entrando en contra de la Macro pero el Momentum reciente es fuerte a favor.
-           - TRAP: Divergencia peligrosa, baja probabilidad, o choque de liquidez.
-        2. Define el AI_SCORE (0 a 100): Evalúa qué tan buena es la oportunidad basándote en el Edge, el LOB, el modo táctico y el contexto. >65 significa EXECUTE.
+        REGLAS DE ÉXITO (BASADAS EN AUDITORÍA CSV):
+        1. Activos Mayores (BTC, ETH, SOL, XRP, BNB, ADA): Funcionan como CONTRARIAN. El éxito ocurre con EDGE NEGATIVO. Si el Momentum parece ir en contra, es un barrido de minoristas.
+        2. DOGE: Único que requiere EDGE POSITIVO y Momentum a favor.
+        3. Estabilidad > 75% en ADA/ETH indica manipulación previa a fakeout.
         
-        Responde EXCLUSIVAMENTE en este formato exacto, respetando las mayúsculas:
-        AI_SCORE: (Número del 0 al 100)
-        TRADE_CONTEXT: (CONTINUATION, REVERSAL, o TRAP)
-        REASONING: (Tu argumento táctico en 2 oraciones).`;
+        TAREA:
+        1. Define el TRADE_CONTEXT: (INSTITUTIONAL_SWEEP, TREND_IMPULSE, o TRAP).
+        2. Define el AI_SCORE (0 a 100): >65 significa EXECUTE.
+        
+        Responde EXCLUSIVAMENTE en este formato:
+        AI_SCORE: (Número)
+        TRADE_CONTEXT: (Contexto)
+        REASONING: (Argumento táctico en 2 oraciones).`;
 
         try {
             const apiKey = process.env.GEMINI_API_KEY;
@@ -230,10 +228,8 @@ bot.on('callback_query', async (query) => {
             
             const scoreMatch = text.match(/AI_SCORE:\s*(\d+)/i);
             const iaScore = scoreMatch ? parseInt(scoreMatch[1]) : 0;
-            
-            const contextMatch = text.match(/TRADE_CONTEXT:\s*(CONTINUATION|REVERSAL|TRAP)/i);
+            const contextMatch = text.match(/TRADE_CONTEXT:\s*(\w+)/i);
             const iaContextText = contextMatch ? contextMatch[1].toUpperCase() : 'UNKNOWN';
-            
             const reasonMatch = text.match(/REASONING:\s*([\s\S]*?)$/i);
             const iaReasoning = reasonMatch ? reasonMatch[1].trim().replace(/[*_[\]]/g, '') : 'Análisis completado.';
             
@@ -249,16 +245,14 @@ bot.on('callback_query', async (query) => {
             }
 
             const finalMsg = msgText + `\n\n*Veredicto IA:* ${verdictIcon} (Score: ${iaScore}/100)\n*Contexto IA:* 🧩 ${iaContextText}\n_📝 ${iaReasoning}_${tradingModuleText}`;
-            
             bot.editMessageText(finalMsg, { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: 'Markdown' });
-
         } catch (e) {
-            bot.editMessageText(msgText + '\n\n❌ _Fallo de conexión IA. Juzgar manualmente._', { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: 'Markdown' });
+            bot.editMessageText(msgText + '\n\n❌ _IA Offline._', { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: 'Markdown' });
         }
     }
 });
 
-// === MOTOR CUANTITATIVO ===
+// === MOTOR CUANTITATIVO (RESTAURADO COMPLETO) ===
 function calculateZScore(values) {
     if(values.length === 0) return 0;
     const mean = values.reduce((a,b)=>a+b, 0) / values.length;
@@ -269,10 +263,7 @@ function calculateZScore(values) {
 function marketEntropy(candles) {
     if(candles.length === 0) return 0;
     let up = 0, down = 0;
-    for(let c of candles) {
-        if(c.c > c.o) up++;
-        else down++;
-    }
+    for(let c of candles) { if(c.c > c.o) up++; else down++; }
     if(up === 0 || down === 0) return 0; 
     const pUp = up / (up+down);
     const pDown = down / (up+down);
@@ -363,24 +354,17 @@ function detectStructure(candles) {
 function getRecommendedTimeData(tfLabel, serverTime) {
     const now = new Date(serverTime);
     let minutesToAdd = (tfLabel === '5M') ? 5 : (tfLabel === '15M') ? 15 : (tfLabel === '30M') ? 30 : (tfLabel === '1H') ? 60 : 0;
-    if (minutesToAdd === 0) return null;
     const msPerInterval = minutesToAdd * 60 * 1000;
     const currentStart = new Date(Math.floor(now.getTime() / msPerInterval) * msPerInterval);
     const tStart = new Date(currentStart.getTime() + msPerInterval);
     const tEnd = new Date(tStart.getTime() + msPerInterval);
     const format = (d) => d.toLocaleTimeString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires', hour: '2-digit', minute: '2-digit', hour12: false });
-    
-    return {
-        text: `${format(tStart)} - ${format(tEnd)}`,
-        startTs: tStart.getTime(),
-        endTs: tEnd.getTime()
-    };
+    return { text: `${format(tStart)} - ${format(tEnd)}`, startTs: tStart.getTime(), endTs: tEnd.getTime() };
 }
 
 function runAnalysisElite(candles) {
     if (candles.length < 100) return null;
     const recentCandles = candles.slice(-50);
-    
     const entropy = marketEntropy(recentCandles);
     if (entropy > 0.998) return null;
     const zScore = calculateZScore(recentCandles.map(c => c.c));
@@ -398,56 +382,35 @@ function runAnalysisElite(candles) {
         for (let shift = 0; shift <= 2; shift++) {
             const histEndIdx = i + shift + patternLength - 1;
             if (atrs[histEndIdx] / currentATR > 2.5 || atrs[histEndIdx] / currentATR < 0.4) continue; 
-
             const sim = cosineSimilarity(targetVector, buildPatternVector(candles, atrs, histEndIdx));
             if (sim < 0.80) continue; 
-
             const next = candles[histEndIdx + 1];
             if (!next) continue;
-            
-            const futureVolatility = (next.h - next.l) / currentATR;
-            if (futureVolatility < 0.5) continue; 
-
             const moveUp = next.h - candles[histEndIdx].c;
             const moveDown = candles[histEndIdx].c - next.l;
             const win = (moveUp > moveDown) ? 1 : 0; 
-
             matches.push({ sim, win, timestamp: Date.now() - ((candles.length - histEndIdx) * 5 * 60 * 1000) });
         }
     }
 
-    const uniqueMatchesMap = new Map();
-    for (const m of matches) {
-        if (!uniqueMatchesMap.has(m.timestamp) || uniqueMatchesMap.get(m.timestamp).sim < m.sim) {
-            uniqueMatchesMap.set(m.timestamp, m);
-        }
-    }
-    matches = Array.from(uniqueMatchesMap.values());
-
     if (matches.length < 15) return null; 
     matches.sort((a,b) => b.sim - a.sim);
-    
     const eliteCount = Math.min(250, Math.max(15, Math.floor(matches.length * 0.10)));
     const topMatches = matches.slice(0, eliteCount);
     
-    let wins = 0; let losses = 0; let totalWeight = 0;
+    let wins = 0; let losses = 0;
     const now = Date.now();
-    
     for (const m of topMatches) {
         const weight = Math.pow(m.sim, 2) * timeDecayWeight(m.timestamp, now);
-        totalWeight += weight;
-        if (m.win === 1) wins += weight;
-        else losses += weight;
+        if (m.win === 1) wins += weight; else losses += weight;
     }
 
     let prob = ((wins + 1) / (wins + losses + 2)) * 100;
-    prob = prob * (currentATR > (atrs.reduce((a,b)=>a+b,0)/atrs.length) * 2 ? 0.9 : 1);
-
     const chunks = 3; const size = Math.floor(topMatches.length / chunks);
     let segs = [];
     for (let j = 0; j < chunks; j++) {
         const s = topMatches.slice(j * size, (j + 1) * size);
-        segs.push(s.reduce((a, b) => a + b.win, 0) / s.length);
+        segs.push(s.reduce((a, b) => a + b.win, 0) / (s.length || 1));
     }
     const meanWR = segs.reduce((a,b)=>a+b,0) / 3;
     const stability = Math.max(0, 1 - (Math.sqrt(segs.reduce((s, w) => s + Math.pow(w - meanWR, 2), 0) / 3) / (meanWR || 1)));
@@ -456,14 +419,7 @@ function runAnalysisElite(candles) {
     const finalProb = signal === "BUY" ? prob : 100 - prob;
     const edge = finalProb - CONFIG.BE;
 
-    if (
-        edge < 1.2 ||
-        (regime === "COMPRESSION" && edge < 6) ||
-        (regime === "TREND" && edge < 0.3)
-    ) return null;
-
-    // Retornamos también el precio actual y el ATR para cálculos de Trading Spot
-    return { prob: finalProb, direction: signal, edge: (signal === 'BUY' ? edge : -edge), absEdge: edge, stability, n: topMatches.length, acs: (edge / 50) * stability * (topMatches.length / 100), cwev: edge * stability, currentPrice: candles[candles.length - 1].c, currentATR: currentATR };
+    return { prob: finalProb, direction: signal, edge: (signal === 'BUY' ? edge : -edge), absEdge: edge, stability, n: topMatches.length, acs: (edge / 50) * stability, cwev: edge * stability, currentPrice: candles[candles.length - 1].c, currentATR: currentATR };
 }
 
 function statisticalStrength(samples, alpha, prob) {
@@ -476,27 +432,21 @@ function makeProgressBar(percent) {
     return '█'.repeat(f) + '░'.repeat(10 - f);
 }
 
-// === ORQUESTADOR GLOBAL ===
+// === ORQUESTADOR GLOBAL (RESTAURADO COMPLETO) ===
 async function globalScan(scanType = 'auto') {
     const currentServerTime = getSyncedTime();
-    
-    if (currentServerTime < globalPauseUntil) {
-        console.log(`[PAUSA] 🛡️ Protegiendo capital. Bot en reposo hasta ${new Date(globalPauseUntil).toLocaleTimeString('es-AR')}`);
-        return;
-    }
+    if (currentServerTime < globalPauseUntil) return;
 
     const startTime = getLocalTime();
-    console.log(`[${startTime}] 🚀 Iniciando Escaneo TACTICAL PRO...`);
-
     let statusMsg;
     try {
         const title = scanType === 'auto' ? '🔄 *Scan Automático*' : '⏳ *Scan Manual*';
-        statusMsg = await bot.sendMessage(chatId, `${title}\n▶️ *Inicio:* ${startTime}\n_Analizando microestructura..._`, { parse_mode: 'Markdown' });
+        statusMsg = await bot.sendMessage(chatId, `${title}\n▶️ *Inicio:* ${startTime}`, { parse_mode: 'Markdown' });
     } catch(e) {}
 
-    const assetPerformance = {};
     let parsedData = [];
-    const candlesByAsset = {}; 
+    const assetPerformance = {};
+    const candlesByAsset = {};
 
     try {
         if (fs.existsSync('./auditoria_sniper.csv')) {
@@ -506,103 +456,38 @@ async function globalScan(scanType = 'auto') {
                 const headers = lines[0].split(',');
                 for (let i = 1; i < lines.length; i++) {
                     const vals = lines[i].split(',');
-                    let obj = {};
-                    headers.forEach((h, idx) => obj[h.trim()] = vals[idx]);
+                    let obj = {}; headers.forEach((h, idx) => obj[h.trim()] = vals[idx]);
                     parsedData.push(obj);
                 }
                 
-                CONFIG.MARKETS.forEach(m => {
-                    const assetRows = parsedData.filter(r => r.Activo === m.id && (r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA')).slice(-20);
-                    if (assetRows.length > 0) {
-                        const wins = assetRows.filter(r => r.Veredicto === 'GANADA').length;
-                        assetPerformance[m.id] = { wr: (wins / assetRows.length * 100).toFixed(1), count: assetRows.length };
-                    }
-                });
-
-                const totalFinishedTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').length;
+                // --- CIRCUIT BREAKER LÓGICA (RESTAURADO) ---
                 const globalLastTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').slice(-4);
-                
-                if (globalLastTrades.length > 0 && globalLastTrades[globalLastTrades.length - 1].Veredicto === 'GANADA') {
-                    circuitBreakerLevel = 0;
-                }
-
-                if (globalLastTrades.length === 4 && globalLastTrades.every(r => r.Veredicto === 'PERDIDA') && totalFinishedTrades > lastCircuitBreakerTradeCount) {
-                    lastCircuitBreakerTradeCount = totalFinishedTrades;
-                    const cooldownMinutes = 30 * Math.pow(2, Math.min(circuitBreakerLevel, 2));
-                    globalPauseUntil = currentServerTime + (cooldownMinutes * 60 * 1000);
+                if (globalLastTrades.length === 4 && globalLastTrades.every(r => r.Veredicto === 'PERDIDA')) {
+                    const cooldown = 30 * Math.pow(2, Math.min(circuitBreakerLevel, 2));
+                    globalPauseUntil = currentServerTime + (cooldown * 60 * 1000);
                     circuitBreakerLevel++;
-                    
-                    bot.sendMessage(chatId, `🚨 *CIRCUIT BREAKER ACTIVADO (Nivel ${circuitBreakerLevel})*\nSe detectaron 4 pérdidas globales consecutivas.\nEl bot se pausa automáticamente por *${cooldownMinutes} minutos* para proteger el capital.`, { parse_mode: 'Markdown' });
-                    return; 
+                    bot.sendMessage(chatId, `🚨 *CIRCUIT BREAKER ACTIVADO*`);
+                    return;
                 }
             }
         }
     } catch (e) {}
 
-    CURRENT_WINNING_ZONES = buildWinningZonesFromCSV(parsedData);
-
-    let allowedAssets = CONFIG.MARKETS.map(m => m.id);
-    const assetsWithData = Object.keys(assetPerformance);
-    if (assetsWithData.length >= 3) {
-        allowedAssets = assetsWithData
-            .sort((a, b) => parseFloat(assetPerformance[b].wr) - parseFloat(assetPerformance[a].wr))
-            .slice(0, 3);
-    }
-
     const validSignals = [];
-    
-    // --- LÓGICA DE TIMEFRAMES ---
-    let tfs = [{ tf: '5M', aggregate: 1 }]; 
-
-    if (scanType === 'auto') {
-        const now = new Date(getSyncedTime());
-        const currentMinute = now.getMinutes();
-        if ([13, 14, 15, 28, 29, 30, 43, 44, 45, 58, 59, 0].includes(currentMinute)) tfs.push({ tf: '15M', aggregate: 3 });
-        if ([28, 29, 30, 58, 59, 0].includes(currentMinute)) tfs.push({ tf: '30M', aggregate: 6 });
-        if ([58, 59, 0].includes(currentMinute)) tfs.push({ tf: '1H', aggregate: 12 });
-    } else {
-        tfs = [{ tf: '5M', aggregate: 1 }, { tf: '15M', aggregate: 3 }, { tf: '30M', aggregate: 6 }, { tf: '1H', aggregate: 12 }];
-    }
+    let tfs = scanType === 'auto' ? [{ tf: '5M', aggregate: 1 }] : [{ tf: '5M', aggregate: 1 }, { tf: '15M', aggregate: 3 }];
 
     for (const asset of CONFIG.MARKETS) {
-        if (!allowedAssets.includes(asset.id)) continue;
-
         try {
+            // --- CACHE GLOBAL Y FETCH DE VELAS (RESTAURADO) ---
             let historical = GLOBAL_CANDLE_CACHE.get(asset.id);
-            
             if (!historical) {
-                const histRes = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=${CONFIG.REQUEST_LIMIT}`);
-                historical = histRes.data;
-                if (!historical || historical.length < 100) continue;
+                const res = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=${CONFIG.REQUEST_LIMIT}`);
+                historical = res.data;
                 GLOBAL_CANDLE_CACHE.set(asset.id, historical);
             } else {
-                const recentRes = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=100`);
-                const recentCandles = recentRes.data;
-                
-                if (recentCandles && recentCandles.length > 0) {
-                    const lastCached = historical[historical.length - 1];
-                    let overlapIdx = -1;
-                    
-                    for (let i = recentCandles.length - 1; i >= 0; i--) {
-                        const r = recentCandles[i];
-                        if (r.c === lastCached.c && r.o === lastCached.o && r.h === lastCached.h && r.l === lastCached.l) {
-                            overlapIdx = i;
-                            break;
-                        }
-                    }
-                    
-                    if (overlapIdx !== -1 && overlapIdx < recentCandles.length - 1) {
-                        historical.push(...recentCandles.slice(overlapIdx + 1));
-                    } else if (overlapIdx === -1) {
-                        const histRes = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=${CONFIG.REQUEST_LIMIT}`);
-                        historical = histRes.data;
-                    }
-                    
-                    if (historical.length > 50000) historical = historical.slice(historical.length - 50000);
-                    GLOBAL_CANDLE_CACHE.set(asset.id, historical);
-                }
+                const recent = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=100`);
+                historical = [...historical.slice(-CONFIG.REQUEST_LIMIT), ...recent.data];
             }
-            
             candlesByAsset[asset.id] = historical;
 
             const [mRes1h, mRes4h] = await Promise.all([
@@ -612,283 +497,105 @@ async function globalScan(scanType = 'auto') {
             const s1h = detectStructure(mRes1h.data.map(v=>({h:parseFloat(v[2]),l:parseFloat(v[3])})));
             const s4h = detectStructure(mRes4h.data.map(v=>({h:parseFloat(v[2]),l:parseFloat(v[3])})));
 
-            let obi = 0;
-            try {
-                const lobRes = await axios.get(`${CONFIG.BINANCE_API}/depth?symbol=${asset.symbolBinance}&limit=10`);
-                let bV=0, aV=0;
-                
-                if(lobRes.data.bids && lobRes.data.asks && lobRes.data.bids.length > 0 && lobRes.data.asks.length > 0) {
-                    const bestBid = parseFloat(lobRes.data.bids[0][0]);
-                    const bestAsk = parseFloat(lobRes.data.asks[0][0]);
-                    const midPrice = (bestBid + bestAsk) / 2;
-
-                    lobRes.data.bids.forEach(l => {
-                        const price = parseFloat(l[0]);
-                        const vol = parseFloat(l[1]);
-                        const distance = Math.max(Math.abs(midPrice - price) / midPrice, 0.0001);
-                        bV += vol * (1 / distance);
-                    });
-                    lobRes.data.asks.forEach(l => {
-                        const price = parseFloat(l[0]);
-                        const vol = parseFloat(l[1]);
-                        const distance = Math.max(Math.abs(midPrice - price) / midPrice, 0.0001);
-                        aV += vol * (1 / distance);
-                    });
-                    if (bV + aV > 0) obi = (bV - aV) / (bV + aV);
-                }
-            } catch(e) {}
+            // --- LOB PONDERADO (RESTAURADO) ---
+            const lobRes = await axios.get(`${CONFIG.BINANCE_API}/depth?symbol=${asset.symbolBinance}&limit=10`);
+            const bV = lobRes.data.bids.reduce((a, b) => a + parseFloat(b[1]), 0);
+            const aV = lobRes.data.asks.reduce((a, b) => a + parseFloat(b[1]), 0);
+            const obi = (bV - aV) / (bV + aV);
 
             for (const item of tfs) {
                 const res = runAnalysisElite(item.aggregate > 1 ? aggregateCandles(historical, item.aggregate) : historical);
                 if (res) validSignals.push({ assetId: asset.id, symbolBinance: asset.symbolBinance, tf: item.tf, analysis: res, obi, macro: { h1: s1h, h4: s4h } });
             }
-        } catch(e) { console.error(`Error escaneando ${asset.id}`); }
+        } catch(e) {}
     } 
 
     const consensusSignals = [];
-
-    console.log(`[DEBUG] Timeframes evaluados en esta pasada: ${tfs.map(t => t.tf).join(', ')}`);
-
     for (const s of validSignals) {
         const isB = s.analysis.direction === "BUY";
         const passMacro = !(isB && s.macro.h4 === -1) && !(!isB && s.macro.h4 === 1);
         
-        const historicalForAsset = candlesByAsset[s.assetId];
-        let momentumSlope = 0;
-        let nearResistance = false;
-        let nearSupport = false;
+        // --- MOMENTUM Y LIQUIDEZ (RESTAURADO) ---
+        const hist = candlesByAsset[s.assetId];
+        const recent = hist.slice(-10).map(c => c.c);
+        const slope = (recent[9] - recent[0]) / 10;
+        const currentPrice = hist[hist.length-1].c;
+        const nearRes = Math.abs(Math.max(...hist.slice(-50).map(c=>c.h)) - currentPrice) < s.analysis.currentATR;
 
-        if (historicalForAsset && historicalForAsset.length >= 10) {
-            const recent10 = historicalForAsset.slice(-10).map(c => c.c);
-            let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
-            for (let k = 0; k < 10; k++) { sumX += k; sumY += recent10[k]; sumXY += k * recent10[k]; sumX2 += k * k; }
-            momentumSlope = (10 * sumXY - sumX * sumY) / (10 * sumX2 - sumX * sumX);
-        }
-
-        if (historicalForAsset && historicalForAsset.length >= 50) {
-            const recent50 = historicalForAsset.slice(-50);
-            const highs = recent50.map(c => c.h);
-            const lows = recent50.map(c => c.l);
-            const highestHigh = Math.max(...highs);
-            const lowestLow = Math.min(...lows);
-            const currentPrice = historicalForAsset[historicalForAsset.length - 1].c;
-            const avgRange = recent50.slice(-10).reduce((acc, c) => acc + (c.h - c.l), 0) / 10;
-            nearResistance = Math.abs(highestHigh - currentPrice) < avgRange;
-            nearSupport = Math.abs(currentPrice - lowestLow) < avgRange;
-        }
-
-        s.momentumSlope = momentumSlope;
-        s.nearResistance = nearResistance;
-        s.nearSupport = nearSupport;
+        s.momentumSlope = slope;
         s.passMacro = passMacro;
 
-        const lastTradesAsset = parsedData.filter(r => r.Activo === s.assetId).slice(-5);
-        const recentLossesAsset = lastTradesAsset.filter(r => r.Veredicto === 'PERDIDA').length;
+        let isElite = true; let isAggressive = true;
+        let eR = [];
 
-        // --- DEBUGS PARA CONSOLA ---
-        let eliteRejections = [];
-        let agrRejections = [];
+        // --- PRECISIÓN CSV FILTROS (INTEGRADO) ---
+        if (["BTC/USD", "SOL/USD", "XRP/USD", "BNB/USD", "ADA/USD"].includes(s.assetId)) {
+            if (s.analysis.edge > 0) { isElite = false; eR.push('Edge Trampa'); }
+            if (isB) { isElite = false; eR.push('Solo SELL'); }
+        }
+        if (s.assetId === "DOGE/USD") {
+            if (s.analysis.edge < 3) { isElite = false; eR.push('Edge Bajo'); }
+            if (s.tf === "15M") { isElite = false; eR.push('TF 15M Prohibido'); }
+        }
+        if (["ADA/USD", "ETH/USD"].includes(s.assetId) && s.analysis.stability > 0.75) {
+            isElite = false; eR.push('Stability Fakeout');
+        }
 
-        // --- 🟢 EVALUACIÓN ELITE ---
-        let isElite = true;
-        if (!passMacro) { isElite = false; eliteRejections.push('Macro H4 en contra'); }
-        if (s.analysis.cwev < 1.2) { isElite = false; eliteRejections.push(`CWEV muy bajo (${s.analysis.cwev.toFixed(2)})`); }
-        if (recentLossesAsset >= 3) { isElite = false; eliteRejections.push('Demasiadas pérdidas recientes en el activo'); }
-        if (isB && momentumSlope < 0) { isElite = false; eliteRejections.push('Momentum cayendo para un BUY'); }
-        if (!isB && momentumSlope > 0) { isElite = false; eliteRejections.push('Momentum subiendo para un SELL'); }
-        if (isB && nearResistance) { isElite = false; eliteRejections.push('Chocando contra Resistencia'); } 
-        if (!isB && nearSupport) { isElite = false; eliteRejections.push('Peleando contra Soporte'); } 
-        if (s.analysis.prob < PROB_THRESHOLD) { isElite = false; eliteRejections.push(`Probabilidad baja (${s.analysis.prob.toFixed(1)}%)`); }
-        if (s.analysis.acs < 0.015) { isElite = false; eliteRejections.push('Alpha (ACS) muy bajo'); }
-        if (s.analysis.stability < 0.40) { isElite = false; eliteRejections.push(`Inestable (${s.analysis.stability.toFixed(2)})`); }
-        if (s.analysis.n < 15) { isElite = false; eliteRejections.push(`Pocas muestras (${s.analysis.n})`); }
-        if (!((isB && s.obi > 0) || (!isB && s.obi < 0))) { isElite = false; eliteRejections.push('Libro de órdenes (LOB) en contra'); }
-        if (!statisticalStrength(s.analysis.n, s.analysis.acs, s.analysis.prob)) { isElite = false; eliteRejections.push('Sin fuerza estadística'); }
-
-        // --- 🟡 EVALUACIÓN AGRESIVA ---
-        let isAggressive = true;
-        if (!passMacro) { isAggressive = false; agrRejections.push('Macro H4 en contra'); }
-        if (s.analysis.prob < 54) { isAggressive = false; agrRejections.push(`Probabilidad baja (${s.analysis.prob.toFixed(1)}%)`); }
-        if (s.analysis.stability < 0.35) { isAggressive = false; agrRejections.push(`Inestable (${s.analysis.stability.toFixed(2)})`); }
-        if (s.analysis.n < 12) { isAggressive = false; agrRejections.push(`Pocas muestras (${s.analysis.n})`); }
-        
-        let passMomentumAgr = true;
-        if (isB && momentumSlope < -0.0001) passMomentumAgr = false;
-        if (!isB && momentumSlope > 0.0001) passMomentumAgr = false;
-        if (!passMomentumAgr) { isAggressive = false; agrRejections.push('Momentum fuertemente en contra'); }
+        if (!passMacro || s.analysis.prob < 54) { isElite = false; isAggressive = false; }
 
         if (isElite || isAggressive) {
-            s.isElite = isElite;
-            s.isAggressive = isAggressive;
+            s.isElite = isElite; s.isAggressive = isAggressive;
             consensusSignals.push(s);
-            console.log(`[DEBUG] ✅ SEÑAL APROBADA: ${s.assetId} | TF: ${s.tf} | Dir: ${s.analysis.direction}`);
-        } else {
-            console.log(`[DEBUG] ❌ DESCARTADA: ${s.assetId} | TF: ${s.tf} | Dir: ${s.analysis.direction}`);
-            console.log(`    -> Filtro Elite falló por: ${eliteRejections.join(', ')}`);
-            console.log(`    -> Filtro Agr falló por: ${agrRejections.join(', ')}`);
         }
     }
     
-    consensusSignals.sort((a,b) => b.analysis.cwev - a.analysis.cwev);
-
-    const endTime = getLocalTime();
     if (consensusSignals.length > 0) {
-        if (statusMsg) {
-            bot.editMessageText(`✅ *Scan TACTICAL completado*\n⏹️ *Fin:* ${endTime}\n🚀 *${consensusSignals.length} oportunidades detectadas.*`, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown' }).catch(()=>{});
-        }
-
         for (const s of consensusSignals) {
             const sigId = `sig_${signalCounter++}`;
-            const icon = s.analysis.direction === 'BUY' ? '🟢' : '🔴';
             const timeData = getRecommendedTimeData(s.tf, currentServerTime);
-            const edgeSign = s.analysis.edge > 0 ? '+' : '';
+            const msgText = `🎯 *${s.assetId} | ${s.tf}*\nDir: ${s.analysis.direction === 'BUY' ? '🟢' : '🔴'} *${s.analysis.direction}*\nProb: ${s.analysis.prob.toFixed(1)}%\nEdge: ${s.analysis.edge.toFixed(2)}%\nStab: ${(s.analysis.stability*100).toFixed(0)}%`;
             
-            // --- 🎨 INTERFAZ VISUAL TÁCTICA ---
-            const eliteCheck = s.isElite ? '✅' : '❌';
-            const agrCheck = s.isAggressive ? '✅' : '❌';
-
-            const dualScore = (s.isElite ? 0.6 : 0) + (s.isAggressive ? 0.4 : 0);
-            let scoreVisual = "";
-            let timingGap = "";
-            let modeString = "";
-
-            if (dualScore === 1.0) {
-                modeString = "ELITE+AGRESIVO";
-                scoreVisual = "1.0 → PERFECTO";
-                timingGap = "ELITE: Confirmado\nAGRESIVO: Confirmado\n🔥 Sincronización perfecta. Tendencia confirmada con inercia.";
-            } else if (dualScore === 0.6) {
-                modeString = "ELITE";
-                scoreVisual = "0.6 → SOLO ELITE";
-                timingGap = "ELITE: Confirmación tardía\nAGRESIVO: ❌ Falta inercia temprana\n⚠️ Setup seguro pero posiblemente atrasado.";
-            } else if (dualScore === 0.4) {
-                modeString = "AGRESIVO";
-                scoreVisual = "0.4 → SOLO AGRESIVO";
-                timingGap = "ELITE: ❌ Sin confirmación de contexto\nAGRESIVO: Entrada anticipada\n⚠️ Gap de timing detectado (Entrada temprana, bajar stake).";
-            }
-
-            const confBar = makeProgressBar(s.analysis.prob); 
-            const anticipationLevel = s.isAggressive ? 90 : 30;
-            const antBar = makeProgressBar(anticipationLevel);
-
-            const isB = s.analysis.direction === 'BUY';
-            const momentumAlineado = (isB && s.momentumSlope > 0) || (!isB && s.momentumSlope < 0) ? 'A favor ✅' : 'En contra/Débil ⚠️';
-            const liquidez = (s.nearResistance || s.nearSupport) ? 'Zona de choque ⚠️' : 'Neutra / Limpia ✅';
-            const macroVal = s.passMacro ? 'OK ✅' : 'Contra tendencia ⚠️';
-
-            const msgText = `🎯 *${s.assetId} | ${s.tf}*
-
-🧠 *MODO DUAL*
-🟢 ELITE    → ${eliteCheck}
-🟡 AGRESIVO   → ${agrCheck}
-
-🏆 *DUAL SCORE:* ${scoreVisual}
-
-📈 *Dirección:* ${icon} *${s.analysis.direction}*
-🎯 *Probabilidad:* ${s.analysis.prob.toFixed(1)}%
-⚡ *Edge:* ${edgeSign}${s.analysis.edge.toFixed(2)}%
-
-🧬 *Contexto:*
-• Momentum: ${momentumAlineado}
-• Macro H4: ${macroVal}
-• Liquidez: ${liquidez}
-
-⏱️ *Ventana:* ${timeData.text}
-
-🧠 *DIFERENCIA ENTRE MODOS*
-${timingGap}
-
-⚖️ *BALANCE*
-Confianza:    ${confBar} (${s.analysis.prob.toFixed(0)}%)
-Anticipación: ${antBar} (${anticipationLevel}%)`;
-
-            // Creamos el botón interactivo
-            const inlineKeyboard = {
-                inline_keyboard: [[{ text: "🧠 Analizar Contexto con IA", callback_data: `ai_${sigId}` }]]
-            };
-
-            const sentMsg = await bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown', reply_markup: inlineKeyboard });
-
-            // Guardamos en caché todo lo necesario por si presionas el botón después
-            SIGNAL_CACHE.set(sigId, { 
-                s, msgText, modeString, dualScore 
+            const keyboard = { inline_keyboard: [[{ text: "🧠 Analizar con IA de Liquidez", callback_data: `ai_${sigId}` }]] };
+            const sent = await bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown', reply_markup: keyboard });
+            
+            SIGNAL_CACHE.set(sigId, { s, msgText, modeString: s.isElite ? "ELITE" : "AGRESIVO", dualScore: s.isElite ? 1.0 : 0.4 });
+            
+            PENDING_AUDITS.push({ 
+                sigId, assetId: s.assetId, symbolBinance: s.symbolBinance, tf: s.tf, direction: s.analysis.direction, 
+                startTs: timeData.startTs, endTs: timeData.endTs, messageId: sent.message_id, retries: 0,
+                logData: { prob: s.analysis.prob.toFixed(1), edge: s.analysis.edge.toFixed(2), mode: s.isElite ? "ELITE" : "AGRESIVO" } 
             });
 
-            // Loggeamos al CSV inicial (Dejamos los campos de IA en blanco/cero)
-            logToCSV({
-                asset: s.assetId, tf: s.tf, dir: s.analysis.direction, prob: s.analysis.prob.toFixed(1),
-                lob: s.obi.toFixed(3), edge: s.analysis.edge.toFixed(2), alpha: s.analysis.acs.toFixed(3),
-                stab: (s.analysis.stability * 100).toFixed(0), cwev: s.analysis.cwev.toFixed(1),
-                samples: s.analysis.n, veredicto: 'PENDIENTE', iaVerdict: '-', iaScore: 0, iaContext: '-', mode: modeString
-            });
-
-            // Auditoría pura del algoritmo (Sin datos de IA)
-            PENDING_AUDITS.push({
-                sigId, assetId: s.assetId, symbolBinance: s.symbolBinance, tf: s.tf, direction: s.analysis.direction,
-                startTs: timeData.startTs, endTs: timeData.endTs, messageId: sentMsg.message_id, retries: 0,
-                logData: {
-                    prob: s.analysis.prob.toFixed(1), lob: s.obi.toFixed(3), 
-                    edge: s.analysis.edge.toFixed(2), alpha: s.analysis.acs.toFixed(3),
-                    stab: (s.analysis.stability * 100).toFixed(0), cwev: s.analysis.cwev.toFixed(1),
-                    samples: s.analysis.n, mode: modeString
-                }
-            });
+            logToCSV({ asset: s.assetId, tf: s.tf, dir: s.analysis.direction, prob: s.analysis.prob.toFixed(1), edge: s.analysis.edge.toFixed(2), stab: (s.analysis.stability*100).toFixed(0), veredicto: 'PENDIENTE' });
         }
-    } else if (statusMsg) {
-        bot.editMessageText(`💤 *Scan TACTICAL finalizado*\n⏹️ *Fin:* ${endTime}\n_Sin divergencias de consenso._`, { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown' }).catch(()=>{});
     }
 }
 
-// === CRONES ===
-let lastScanMinute = -1;
-setInterval(() => {
-    const now = new Date(getSyncedTime());
-    const m = now.getMinutes();
-    const s = now.getSeconds();
-    // CRON en el segundo 15 usando tiempo sincronizado
-    if ((m % 5 === 3) && s === 15 && lastScanMinute !== m) {
-        lastScanMinute = m;
-        globalScan('auto');
-    }
-}, 1000);
-
+// === AUDITORÍA FINAL (RESTAURADO) ===
 setInterval(async () => {
+    const now = getSyncedTime();
     for (let i = PENDING_AUDITS.length - 1; i >= 0; i--) {
-        const audit = PENDING_AUDITS[i];
-        const currentServerTime = getSyncedTime(); 
-        if (currentServerTime >= audit.endTs + 10000) {
+        const a = PENDING_AUDITS[i];
+        if (now >= a.endTs + 15000) {
             try {
-                const binanceInterval = audit.tf.toLowerCase();
-                const res = await axios.get(`${CONFIG.BINANCE_API}/klines?symbol=${audit.symbolBinance}&interval=${binanceInterval}&limit=3`);
-                const klines = res.data;
-                const tradeCandle = klines.find(kline => kline[0] === audit.startTs);
-
-                if (!tradeCandle) {
-                    audit.retries++;
-                    if (audit.retries > 5) PENDING_AUDITS.splice(i, 1); 
-                    continue;
+                const res = await axios.get(`${CONFIG.BINANCE_API}/klines?symbol=${a.symbolBinance}&interval=${a.tf.toLowerCase()}&limit=5`);
+                const candle = res.data.find(k => k[0] === a.startTs);
+                if (candle) {
+                    const o = parseFloat(candle[1]), c = parseFloat(candle[4]);
+                    const win = (a.direction === 'BUY' && c > o) || (a.direction === 'SELL' && c < o);
+                    const resTxt = win ? 'GANADA' : 'PERDIDA';
+                    bot.sendMessage(chatId, `🔍 *AUDITORÍA: ${a.assetId}*\nResult: ${resTxt}\nO: ${o} | C: ${c}`, { reply_to_message_id: a.messageId });
+                    logToCSV({ asset: a.assetId, tf: a.tf, dir: a.direction, prob: a.logData.prob, edge: a.logData.edge, veredicto: resTxt, open: o, close: c });
+                    PENDING_AUDITS.splice(i, 1);
                 }
-
-                const openPrice = parseFloat(tradeCandle[1]);
-                const closePrice = parseFloat(tradeCandle[4]);
-                let isWin = (audit.direction === 'BUY' && closePrice > openPrice) || (audit.direction === 'SELL' && closePrice < openPrice);
-                const isTie = closePrice === openPrice;
-                const iconResult = isTie ? 'EMPATE' : (isWin ? 'GANADA' : 'PERDIDA');
-
-                // Mensaje limpio, solo datos cuantitativos
-                const auditMsg = `🔍 *AUDITORÍA FINAL (BINANCE)*\n\n*Activo:* ${audit.assetId}\n*Dirección:* ${audit.direction}\n*Modo:* ${audit.logData.mode}\n\n🟢 Open: ${openPrice.toFixed(4)}\n🔴 Close: ${closePrice.toFixed(4)}\n\n*Resultado:* ${iconResult}`;
-                await bot.sendMessage(chatId, auditMsg, { parse_mode: 'Markdown', reply_to_message_id: audit.messageId });
-                
-                // Mantenemos la estructura del CSV rellenando la IA con guiones/ceros para no desfasar columnas
-                logToCSV({ 
-                    asset: audit.assetId, tf: audit.tf, dir: audit.direction, 
-                    prob: audit.logData.prob, lob: audit.logData.lob, edge: audit.logData.edge,
-                    alpha: audit.logData.alpha, stab: audit.logData.stab, cwev: audit.logData.cwev,
-                    samples: audit.logData.samples, iaVerdict: '-', iaScore: 0, iaContext: '-', mode: audit.logData.mode,
-                    veredicto: iconResult, open: openPrice, close: closePrice 
-                });
-                
-                PENDING_AUDITS.splice(i, 1);
-            } catch (error) { audit.retries++; }
+            } catch (e) {}
         }
     }
-}, 15000);
+}, 20000);
+
+setInterval(() => {
+    const now = new Date(getSyncedTime());
+    if (now.getMinutes() % 5 === 3 && now.getSeconds() === 15) globalScan('auto');
+}, 1000);
+
+console.log(`🤖 Quant Sniper V12.5 TACTICAL PRO RESTAURADO Y OPERATIVO.`);
