@@ -896,19 +896,48 @@ bot.on('callback_query', async (query) => {
     }
 });
 
-// === CRONES DINÁMICOS ===
+// ═══════════════════════════════════════════════════════════════════
+// MÓDULO 7: CRONES DINÁMICOS (CON PRECISIÓN SNIPER Y ANTI-MISS)
+// ═══════════════════════════════════════════════════════════════════
+
+let lastScanExecution = 0; // Control de disparo único
+
 setInterval(async () => { 
     let volSum = 0, count = 0;
+
+    // Calculamos el pulso global del mercado con los datos en memoria
     for (const candles of GLOBAL_CANDLE_CACHE.values()) {
         const atrs = precalcATR(candles);
         const atr = atrs[atrs.length - 1];
         const price = candles[candles.length - 1].c;
-        if (atr && price) { volSum += atr / price; count++; }
+        if (atr && price) { 
+            volSum += atr / price; 
+            count++; 
+        }
     }
+
     const avgVol = count > 0 ? volSum / count : 0.002;
-    const targetSecond = getDynamicSecond(avgVol);
+    
+    // 🧠 Fallback inteligente: Si la caché está vacía al arrancar, apunta al segundo 15 seguro.
+    const targetSecond = count > 0 ? getDynamicSecond(avgVol) : 15;
+    
     const now = new Date(getSyncedTime()); 
-    if ((now.getMinutes() % 5 === 3) && Math.abs(now.getSeconds() - targetSecond) <= 1) globalScan('auto'); 
+    const minuteMatch = (now.getMinutes() % 5 === 3);
+    
+    // Ventana de 2 segundos para tolerar latencia del servidor
+    const secondWindow = Math.abs(now.getSeconds() - targetSecond) <= 2;
+
+    // 🚀 ANTI-DUPLICADO + ANTI-MISS
+    if (minuteMatch && secondWindow) {
+        const nowTs = Date.now();
+
+        // Evita que la ventana de 2 segundos dispare el scan 2 o 3 veces seguidas
+        if (nowTs - lastScanExecution > 10000) { 
+            lastScanExecution = nowTs;
+            console.log(`[SYS] 🚀 AUTO SCAN DISPARADO: ${now.toLocaleTimeString('es-AR')} (Target Sec: ${targetSecond})`);
+            globalScan('auto'); 
+        }
+    }
 }, 1000);
 
 // 🚀 CRON DE AUDITORÍA Y APRENDIZAJE
