@@ -184,6 +184,19 @@ bot.onText(/\/scan/, async (msg) => {
 console.log(`🤖 Quant Sniper V12.5 TACTICAL PRO iniciando...`);
 bot.sendMessage(chatId, '🟢 *Quant Sniper V12.5 TACTICAL PRO* encendido.\nModo: Semáforo Visual + IA a Demanda + Módulo Trading Spot', { parse_mode: 'Markdown' });
 
+// === FUNCION MODULARIZADA IA ===
+async function consultarGemini(prompt) {
+    try {
+        const apiKey = process.env.GEMINI_API_KEY;
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
+        const result = await axios.post(url, { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2 } });
+        return result.data.candidates[0].content.parts[0].text;
+    } catch (error) {
+        console.error("[SYS] Error consultando Gemini:", error.message);
+        return null;
+    }
+}
+
 // === HANDLER DEL BOTÓN DE IA ===
 bot.on('callback_query', async (query) => {
     const data = query.data;
@@ -195,6 +208,15 @@ bot.on('callback_query', async (query) => {
     if (!s) {
         return bot.answerCallbackQuery(query.id, { text: "⏳ La señal expiró o ya no está en caché.", show_alert: true });
     }
+
+    if (s.aiProcessed) {
+        return bot.answerCallbackQuery(query.id, {
+            text: "⚠️ La IA ya fue ejecutada en esta señal.",
+            show_alert: false
+        });
+    }
+
+    s.aiProcessed = true;
 
     bot.answerCallbackQuery(query.id, { text: "Iniciando análisis cuántico..." });
 
@@ -221,17 +243,16 @@ bot.on('callback_query', async (query) => {
        - TRAP: Divergencia peligrosa, baja probabilidad, o choque de liquidez.
     2. Define el AI_SCORE (0 a 100): Evalúa qué tan buena es la oportunidad basándote en el Edge, el LOB, el modo táctico y el contexto. >65 significa EXECUTE.
     
-    Responde EXCLUSIVAMENTE en este formato exacto, respetando las mayúsculas:
-    AI_SCORE: (Número del 0 al 100)
-    TRADE_CONTEXT: (CONTINUATION, REVERSAL, o TRAP)
-    REASONING: (Tu argumento táctico en 2 oraciones).`;
+    Responde EXACTAMENTE en este formato:
+    AI_SCORE: 78
+    TRADE_CONTEXT: CONTINUATION
+    REASONING: Texto breve`;
 
     try {
-        const apiKey = process.env.GEMINI_API_KEY;
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
-        const result = await axios.post(url, { contents: [{ parts: [{ text: promptText }] }], generationConfig: { temperature: 0.2 } });
-        const text = result.data.candidates[0].content.parts[0].text;
+        const text = await consultarGemini(promptText);
         
+        if (!text) throw new Error("Respuesta vacía de Gemini");
+
         const scoreMatch = text.match(/AI_SCORE:\s*(\d+)/i);
         iaScore = scoreMatch ? parseInt(scoreMatch[1]) : 0;
         
@@ -263,6 +284,7 @@ bot.on('callback_query', async (query) => {
         }
 
     } catch (e) {
+        s.aiProcessed = false; // Permitir reintento en caso de error
         await bot.editMessageText(s.msgText.replace('⏳ _Esperando orden para análisis IA..._', '❌ _Fallo de conexión IA. Intenta de nuevo._'), { 
             chat_id: chatId, 
             message_id: query.message.message_id, 
