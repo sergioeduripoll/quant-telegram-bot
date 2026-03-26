@@ -90,7 +90,7 @@ async function updateTradeResult(signalId, data) {
  * Obtiene los últimos N trades (DESC luego reverse para cronológico).
  * FIX #6: Solo mapea _win para trades resueltos.
  */
-async function getRecentTrades(limit = 1000) {
+async function getRecentTrades(limit = 100) {
     try {
         const { data, error } = await supabase
             .from(TABLE)
