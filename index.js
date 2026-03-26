@@ -1153,10 +1153,11 @@ async function globalScan(scanType = 'auto') {
     // ── Inicio de lógica de scan (intacta) ──
     const currentServerTime = getSyncedTime();
 
-    if (currentServerTime < globalPauseUntil) {
-        console.log(`[PAUSA] Bot en reposo hasta ${new Date(globalPauseUntil).toLocaleTimeString('es-AR')}`);
-        return;
-    }
+    // DISABLED: Circuit Breaker desactivado durante fase de recolección de datos
+    // if (currentServerTime < globalPauseUntil) {
+    //     console.log(`[PAUSA] Bot en reposo hasta ${new Date(globalPauseUntil).toLocaleTimeString('es-AR')}`);
+    //     return;
+    // }
 
     const startTime = getLocalTime();
     console.log(`[${startTime}] 🚀 Scan ADAPTIVE...`);
@@ -1205,23 +1206,23 @@ async function globalScan(scanType = 'auto') {
                 }
             });
 
-            // Circuit Breaker
-            const totalFinishedTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').length;
-            const globalLastTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').slice(-4);
-
-            if (globalLastTrades.length > 0 && globalLastTrades[globalLastTrades.length - 1].Veredicto === 'GANADA') {
-                circuitBreakerLevel = 0;
-            }
-
-            if (globalLastTrades.length === 4 && globalLastTrades.every(r => r.Veredicto === 'PERDIDA') && totalFinishedTrades > lastCircuitBreakerTradeCount) {
-                lastCircuitBreakerTradeCount = totalFinishedTrades;
-                const cooldownMinutes = 30 * Math.pow(2, Math.min(circuitBreakerLevel, 2));
-                globalPauseUntil = currentServerTime + (cooldownMinutes * 60 * 1000);
-                circuitBreakerLevel++;
-
-                bot.sendMessage(chatId, `🚨 *CIRCUIT BREAKER Nivel ${circuitBreakerLevel}*\n4 pérdidas consecutivas → Pausa ${cooldownMinutes}min`, { parse_mode: 'Markdown' });
-                return;
-            }
+            // DISABLED: Circuit Breaker desactivado durante fase de recolección de datos
+            // const totalFinishedTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').length;
+            // const globalLastTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').slice(-4);
+            //
+            // if (globalLastTrades.length > 0 && globalLastTrades[globalLastTrades.length - 1].Veredicto === 'GANADA') {
+            //     circuitBreakerLevel = 0;
+            // }
+            //
+            // if (globalLastTrades.length === 4 && globalLastTrades.every(r => r.Veredicto === 'PERDIDA') && totalFinishedTrades > lastCircuitBreakerTradeCount) {
+            //     lastCircuitBreakerTradeCount = totalFinishedTrades;
+            //     const cooldownMinutes = 30 * Math.pow(2, Math.min(circuitBreakerLevel, 2));
+            //     globalPauseUntil = currentServerTime + (cooldownMinutes * 60 * 1000);
+            //     circuitBreakerLevel++;
+            //
+            //     bot.sendMessage(chatId, `🚨 *CIRCUIT BREAKER Nivel ${circuitBreakerLevel}*\n4 pérdidas consecutivas → Pausa ${cooldownMinutes}min`, { parse_mode: 'Markdown' });
+            //     return;
+            // }
         }
     } catch (e) {
         console.error('[SCAN_DB_LOAD]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
