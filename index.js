@@ -23,8 +23,6 @@ const PROB_THRESHOLD = 54;
 
 // LOCK: Evita scans simultáneos
 let isScanning = false;
-// LOCK: Evita doble ejecución de IA por señal
-const IA_IN_PROGRESS = new Set();
 
 const CONFIG = {
     BE: 54.94,
@@ -68,6 +66,10 @@ const LOSS_STREAKS = {};                                // Capa 1: racha actual 
 // IMPROVEMENT: Set en lugar de Array para O(1) en .has() vs O(n) en .includes()
 const RECENT_FAILURE_PATTERNS = new Set();              // Capa 3: patrones fallidos recientes (max 50)
 let RESOLVED_ROWS_CACHE = [];                           // Cache de filas resueltas para capa 2
+
+// ── Caché de trades en RAM (reduce egress Supabase) ──
+let GLOBAL_TRADES_CACHE = [];
+let LAST_TRADES_FETCH = 0;
 
 
 // ═══════════════════════════════════════════════════════════════════
@@ -958,16 +960,13 @@ function makeProgressBar(percent) {
 
 
 // ═══════════════════════════════════════════════════════════════════
-// MÓDULO 7: IA ON-DEMAND (Gemini via Inline Keyboard)
+// MÓDULO 7: IA AUTOMÁTICA (Gemini — se ejecuta al generar señal)
 // ═══════════════════════════════════════════════════════════════════
 
-async function executeIAAnalysis(sigId) {
-    const signalData = SIGNAL_CACHE.get(sigId);
-    if (!signalData) return null;
+async function executeIAAnalysis(s, modeString) {
+    if (!s || !s.analysis) return null;
 
-    const s = signalData;
     const assetContext = getAssetLearningContext(s.assetId);
-    const modeString = s.modeString || 'UNKNOWN';
     const dualScore = s.dualScore || 0;
 
     const promptText = `Eres un Quant Trader Institucional. Decide el SCORE de ejecución y CLASIFICA el contexto.
@@ -1002,15 +1001,13 @@ REASONING: (2 oraciones).`;
             generationConfig: { temperature: 0.2 }
         });
 
-        // SAFETY: Validación robusta de la respuesta de Gemini
         const candidates = result?.data?.candidates;
         if (!candidates || !candidates[0]?.content?.parts?.[0]?.text) {
-            console.error('[IA_PARSE]', { message: 'Respuesta vacía o malformada de Gemini', time: new Date().toISOString() });
+            console.error('[IA_PARSE]', { message: 'Respuesta vacía de Gemini', time: new Date().toISOString() });
             return null;
         }
         const text = candidates[0].content.parts[0].text;
 
-        // SAFETY: Parsing con fallbacks seguros
         const scoreMatch = text.match(/AI_SCORE:\s*(\d+)/i);
         const iaScore = scoreMatch ? Math.min(100, Math.max(0, parseInt(scoreMatch[1]))) : 0;
 
@@ -1032,101 +1029,10 @@ REASONING: (2 oraciones).`;
             isExecute: iaScore >= 65
         };
     } catch (e) {
-        // FIX: Error detallado con stack
         console.error('[IA_GEMINI]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
         return null;
     }
 }
-
-bot.on('callback_query', async (query) => {
-    const data = query.data;
-    if (!data.startsWith('ia_')) return;
-
-    const sigId = data.replace('ia_', '');
-
-    // LOCK: Evitar doble ejecución de IA para la misma señal
-    if (IA_IN_PROGRESS.has(sigId)) {
-        await bot.answerCallbackQuery(query.id, { text: '⏳ IA ya en proceso...', show_alert: false });
-        return;
-    }
-
-    const signalData = SIGNAL_CACHE.get(sigId);
-
-    if (!signalData) {
-        await bot.answerCallbackQuery(query.id, { text: '⚠️ Señal expirada', show_alert: true });
-        return;
-    }
-
-    await bot.answerCallbackQuery(query.id, { text: '🧠 Consultando IA...' });
-    IA_IN_PROGRESS.add(sigId);
-
-    const originalMsg = signalData._messageText;
-    try {
-        await bot.editMessageText(originalMsg + '\n\n⏳ _Consultando Gemini AI..._', {
-            chat_id: chatId,
-            message_id: signalData._messageId,
-            parse_mode: 'Markdown'
-        });
-    } catch(e) {
-        // FIX: Error silencioso → loggear
-        console.error('[TG_EDIT_LOADING]', { message: e.message, time: new Date().toISOString() });
-    }
-
-    const iaResult = await executeIAAnalysis(sigId);
-
-    if (!iaResult) {
-        IA_IN_PROGRESS.delete(sigId);
-        try {
-            await bot.editMessageText(originalMsg + '\n\n❌ _Fallo IA. Juzgar manualmente._', {
-                chat_id: chatId,
-                message_id: signalData._messageId,
-                parse_mode: 'Markdown'
-            });
-        } catch(e) {
-            // FIX: Error silencioso → loggear
-            console.error('[TG_EDIT_FAIL]', { message: e.message, time: new Date().toISOString() });
-        }
-        return;
-    }
-
-    // Trading optimizado con contexto IA
-    let tradingUpdate = '';
-    if (iaResult.isExecute && iaResult.iaContext !== 'TRAP') {
-        const tradeData = calculateTradeLevels(
-            signalData.analysis.currentPrice,
-            signalData.analysis.direction,
-            signalData.analysis.currentATR,
-            signalData.analysis.absEdge,
-            iaResult.iaContext,
-            circuitBreakerLevel
-        );
-        if (tradeData) {
-            tradingUpdate = `\n\n💰 *TRADING (IA)*\n📍 Entry: \`${tradeData.entry}\`\n🛑 SL: \`${tradeData.sl}\`\n🎯 TP: \`${tradeData.tp}\`\n⚖️ R:R: 1:${tradeData.rr}\n💼 Vol: ${tradeData.positionSize} USDT | Riesgo: ${tradeData.riskPercent}%`;
-        }
-    }
-
-    const verdictIcon = iaResult.isExecute ? '🚀 EXECUTE TRADE' : '❌ PASS';
-    const iaBlock = `\n\n*Veredicto IA:* ${verdictIcon} (Score: ${iaResult.iaScore}/100)${tradingUpdate}`;
-
-    try {
-        await bot.editMessageText(originalMsg + iaBlock, {
-            chat_id: chatId,
-            message_id: signalData._messageId,
-            parse_mode: 'Markdown'
-        });
-    } catch(e) {
-        console.error('[TG_EDIT_IA]', { message: e.message, time: new Date().toISOString() });
-    }
-
-    // DB: Actualizar la fila existente con resultado IA (no insertar duplicado)
-    await db.updateTradeResult(sigId, {
-        veredicto: 'IA_ANALIZADA',
-        iaVerdict: iaResult.iaVerdict,
-        iaScore: iaResult.iaScore,
-        iaContext: iaResult.iaContext
-    });
-    IA_IN_PROGRESS.delete(sigId);
-});
 
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1264,14 +1170,31 @@ async function globalScan(scanType = 'auto') {
         console.error('[TG_SCAN_MSG]', { message: e.message, time: new Date().toISOString() });
     }
 
-    // --- Cargar datos desde Supabase y construir perfiles ---
+    // --- Cargar datos desde Supabase con caché en RAM ---
     let parsedData = [];
     const assetPerformance = {};
     const candlesByAsset = {};
 
     try {
-        // DB: Cargar historial desde Supabase (reemplaza lectura CSV)
-        parsedData = await db.getRecentTrades(1000);
+        // Caché: full fetch cada 1h, micro-update de últimos 30 entre medio
+        const now = Date.now();
+        if (GLOBAL_TRADES_CACHE.length === 0 || (now - LAST_TRADES_FETCH > 60 * 60 * 1000)) {
+            GLOBAL_TRADES_CACHE = await db.getRecentTrades(1000);
+            LAST_TRADES_FETCH = now;
+            console.log(`[CACHE] Full fetch: ${GLOBAL_TRADES_CACHE.length} trades cargados`);
+        } else {
+            const recentTrades = await db.getRecentTrades(30);
+            for (const rt of recentTrades) {
+                if (!rt.signal_id) continue;
+                const index = GLOBAL_TRADES_CACHE.findIndex(t => t.signal_id === rt.signal_id);
+                if (index !== -1) { GLOBAL_TRADES_CACHE[index] = rt; }
+                else { GLOBAL_TRADES_CACHE.push(rt); }
+            }
+            if (GLOBAL_TRADES_CACHE.length > 1000) {
+                GLOBAL_TRADES_CACHE = GLOBAL_TRADES_CACHE.slice(-1000);
+            }
+        }
+        parsedData = GLOBAL_TRADES_CACHE;
 
         if (parsedData.length > 0) {
             CONFIG.MARKETS.forEach(m => {
@@ -1596,53 +1519,59 @@ async function globalScan(scanType = 'auto') {
                 continue;
             }
 
-            // Trade levels sin IA
+            // Preparar datos para IA antes de enviar mensaje
+            s.modeString = modeString;
+            s.dualScore = dualScore;
+            s._adaptiveAdj = adaptiveResult;
+
+            // IA AUTOMÁTICA: ejecutar Gemini para esta señal
+            const iaResult = await executeIAAnalysis(s, modeString);
+
+            // Trade levels: usar contexto IA si disponible, sino default
+            const iaContext = (iaResult && iaResult.isExecute && iaResult.iaContext !== 'TRAP') ? iaResult.iaContext : 'CONTINUATION';
             const tradeData = calculateTradeLevels(
                 s.analysis.currentPrice,
                 s.analysis.direction,
                 s.analysis.currentATR,
                 s.analysis.absEdge,
-                'CONTINUATION',
+                iaContext,
                 circuitBreakerLevel
             );
 
-            // --- UI SIMPLIFICADA (spec exacta) ---
+            // --- MENSAJE COMPLETO (señal + IA + trading en un solo envío) ---
             let msgText = `🎯 *${s.assetId} | ${s.tf}*\n\n`;
             msgText += `MODO: E:${eliteCheck} → A:${agrCheck}\n`;
             msgText += `🏆 ${scoreVisual}\n\n`;
-            msgText += `${icon} *${s.analysis.direction}*\n\n`;
-            msgText += `*BALANCE*\n`;
+            msgText += `${icon} *${s.analysis.direction}*\n`;
 
-            if (tradeData) {
-                msgText += `\n💰 *TRADING*\n`;
-                msgText += `📍 Entry: \`${tradeData.entry}\`\n`;
-                msgText += `🛑 SL: \`${tradeData.sl}\`\n`;
-                msgText += `🎯 TP: \`${tradeData.tp}\`\n`;
+            // Bloque IA
+            if (iaResult) {
+                const verdictIcon = iaResult.isExecute ? '🚀 EXECUTE' : '⛔ PASS';
+                msgText += `\n🧠 *IA:* ${verdictIcon} (${iaResult.iaScore}/100)`;
+            } else {
+                msgText += `\n🧠 _IA no disponible_`;
             }
 
-            msgText += `\n⏱️ Ventana: ${timeData.text}`;
+            // Bloque Trading
+            if (tradeData) {
+                msgText += `\n\n💰 *TRADING*\n`;
+                msgText += `📍 Entry: \`${tradeData.entry}\`\n`;
+                msgText += `🛑 SL: \`${tradeData.sl}\`\n`;
+                msgText += `🎯 TP: \`${tradeData.tp}\``;
+            }
 
-            // Guardar en cache — INMUTABLE: spread para evitar mutación externa
-            s.modeString = modeString;
-            s.dualScore = dualScore;
+            msgText += `\n\n⏱️ Ventana: ${timeData.text}`;
+
             s._createdAt = Date.now();
-            s._adaptiveAdj = adaptiveResult;
 
-            const sentMsg = await bot.sendMessage(chatId, msgText, {
-                parse_mode: 'Markdown',
-                reply_markup: {
-                    inline_keyboard: [[
-                        { text: '🧠 Análisis IA', callback_data: `ia_${sigId}` }
-                    ]]
-                }
-            });
+            // Enviar mensaje SIN botón
+            const sentMsg = await bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' });
 
             s._messageText = msgText;
             s._messageId = sentMsg.message_id;
-            // CACHE INMUTABLE: copia profunda para que modificaciones externas no corrompan
             SIGNAL_CACHE.set(sigId, { ...s, analysis: { ...s.analysis }, macro: { ...s.macro } });
 
-            // DB: Insertar señal con signal_id único (una sola fila por trade)
+            // DB: Insertar señal con IA incluida, veredicto siempre PENDIENTE
             await db.insertTrade({
                 signalId: sigId,
                 asset: s.assetId, tf: s.tf, dir: s.analysis.direction,
@@ -1650,7 +1579,10 @@ async function globalScan(scanType = 'auto') {
                 edge: s.analysis.edge.toFixed(2), alpha: s.analysis.acs.toFixed(3),
                 stab: (s.analysis.stability * 100).toFixed(0), cwev: s.analysis.cwev.toFixed(1),
                 samples: s.analysis.n, veredicto: 'PENDIENTE',
-                iaVerdict: '', iaScore: '', iaContext: '', mode: modeString
+                iaVerdict: iaResult ? iaResult.iaVerdict : '',
+                iaScore: iaResult ? iaResult.iaScore : '',
+                iaContext: iaResult ? iaResult.iaContext : '',
+                mode: modeString
             });
 
             // Auditoría pendiente
@@ -1663,7 +1595,11 @@ async function globalScan(scanType = 'auto') {
                     prob: s.analysis.prob.toFixed(1), lob: s.obi.toFixed(3),
                     edge: s.analysis.edge.toFixed(2), alpha: s.analysis.acs.toFixed(3),
                     stab: (s.analysis.stability * 100).toFixed(0), cwev: s.analysis.cwev.toFixed(1),
-                    samples: s.analysis.n, iaVerdict: '', iaScore: '', iaContext: '', mode: modeString
+                    samples: s.analysis.n,
+                    iaVerdict: iaResult ? iaResult.iaVerdict : '',
+                    iaScore: iaResult ? iaResult.iaScore : '',
+                    iaContext: iaResult ? iaResult.iaContext : '',
+                    mode: modeString
                 }
             });
         }
