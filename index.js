@@ -29,8 +29,8 @@ const IA_IN_PROGRESS = new Set();
 const CONFIG = {
     BE: 54.94,
     BINANCE_API: 'https://api.binance.com/api/v3',
-    BACKEND_URL: 'https://quant-backend-lhue.onrender.com/api',
-    REQUEST_LIMIT: 2000,
+    BACKEND_URL: 'https://quant-backend-lhue.onrender.com/api', // DEPRECATED — ya no se usa
+    REQUEST_LIMIT: 1000,
     MARKETS: [
         { id: 'BTC/USD', symbolBinance: 'BTCUSDT' },
         { id: 'ETH/USD', symbolBinance: 'ETHUSDT' },
@@ -1338,17 +1338,27 @@ async function globalScan(scanType = 'auto') {
     for (const asset of CONFIG.MARKETS) {
         if (!allowedAssets.includes(asset.id)) continue;
 
+        // DELAY: 1s entre activos para no saturar Binance API
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
         try {
             let historical = GLOBAL_CANDLE_CACHE.get(asset.id);
 
+            // Helper: mapear klines de Binance a formato {o, h, l, c}
+            const mapKlines = (data) => data.map(v => ({
+                o: parseFloat(v[1]), h: parseFloat(v[2]), l: parseFloat(v[3]), c: parseFloat(v[4])
+            }));
+
             if (!historical) {
-                const histRes = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=${CONFIG.REQUEST_LIMIT}`);
-                historical = histRes.data;
+                // Sin cache: pedir histórico completo directo a Binance
+                const histRes = await axios.get(`${CONFIG.BINANCE_API}/klines?symbol=${asset.symbolBinance}&interval=5m&limit=${CONFIG.REQUEST_LIMIT}`);
+                historical = mapKlines(histRes.data);
                 if (!historical || historical.length < 100) continue;
                 GLOBAL_CANDLE_CACHE.set(asset.id, historical);
             } else {
-                const recentRes = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=100`);
-                const recentCandles = recentRes.data;
+                // Con cache: pedir últimas 100 velas y mergear
+                const recentRes = await axios.get(`${CONFIG.BINANCE_API}/klines?symbol=${asset.symbolBinance}&interval=5m&limit=100`);
+                const recentCandles = mapKlines(recentRes.data);
 
                 if (recentCandles && recentCandles.length > 0) {
                     const lastCached = historical[historical.length - 1];
@@ -1365,11 +1375,12 @@ async function globalScan(scanType = 'auto') {
                     if (overlapIdx !== -1 && overlapIdx < recentCandles.length - 1) {
                         historical.push(...recentCandles.slice(overlapIdx + 1));
                     } else if (overlapIdx === -1) {
-                        const histRes = await axios.get(`${CONFIG.BACKEND_URL}/candles?symbol=${asset.symbolBinance}&limit=${CONFIG.REQUEST_LIMIT}`);
-                        historical = histRes.data;
+                        // Sin overlap: rebuild completo desde Binance
+                        const histRes = await axios.get(`${CONFIG.BINANCE_API}/klines?symbol=${asset.symbolBinance}&interval=5m&limit=${CONFIG.REQUEST_LIMIT}`);
+                        historical = mapKlines(histRes.data);
                     }
 
-                    if (historical.length > 50000) historical = historical.slice(historical.length - 50000);
+                    if (historical.length > 2000) historical = historical.slice(historical.length - 2000);
                     GLOBAL_CANDLE_CACHE.set(asset.id, historical);
                 }
             }
