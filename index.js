@@ -53,6 +53,11 @@ let circuitBreakerLevel = 0;
 let lastCircuitBreakerTradeCount = 0;
 const GLOBAL_CANDLE_CACHE = new Map();
 
+// ── Memoria Dinámica Adaptativa (3 capas) ──
+const LOSS_STREAKS = {};                        // Capa 1: racha actual por activo
+const RECENT_FAILURE_PATTERNS = [];             // Capa 3: patrones fallidos recientes (FIFO, max 50)
+let RESOLVED_ROWS_CACHE = [];                   // Cache de filas resueltas para capa 2
+
 
 // ═══════════════════════════════════════════════════════════════════
 // MÓDULO 1: SISTEMA DE APRENDIZAJE ADAPTATIVO (CSV INTELLIGENCE)
@@ -114,7 +119,14 @@ function buildAdaptiveProfiles(resolvedRows) {
             minStability: 30,
             lobBias: 0,
             lossPatterns: [],
-            confidence: 'LOW'
+            confidence: 'LOW',
+            // Campos nuevos para evaluateHiddenRisk
+            currentLossStreak: 0,
+            maxLossStreak: 0,
+            avgLossStreak: 0,
+            streaks3Plus: 0,
+            losingCombos: [],  // Array de { fingerprint, wr, n }
+            winningCombos: []  // Array de { fingerprint, wr, n }
         };
 
         if (assetRows.length < 10) {
@@ -218,21 +230,312 @@ function buildAdaptiveProfiles(resolvedRows) {
             profile.lobBias = ((buyAlignedWR.wr + sellAlignedWR.wr) / 2) - profile.overallWR;
         }
 
+        // --- Rachas de pérdidas consecutivas ---
+        const allStreaks = [];
+        let currentStreak = 0;
+        for (const r of assetRows) {
+            if (r._win === 0) {
+                currentStreak++;
+            } else {
+                if (currentStreak > 0) allStreaks.push(currentStreak);
+                currentStreak = 0;
+            }
+        }
+        if (currentStreak > 0) allStreaks.push(currentStreak);
+
+        profile.maxLossStreak = allStreaks.length > 0 ? Math.max(...allStreaks) : 0;
+        profile.avgLossStreak = allStreaks.length > 0 ? allStreaks.reduce((a, b) => a + b, 0) / allStreaks.length : 0;
+        profile.streaks3Plus = allStreaks.filter(s => s >= 3).length;
+
+        // Racha actual (desde el final del historial)
+        let recentStreak = 0;
+        for (let ri = assetRows.length - 1; ri >= 0; ri--) {
+            if (assetRows[ri]._win === 0) recentStreak++;
+            else break;
+        }
+        profile.currentLossStreak = recentStreak;
+
+        // --- Fingerprinting de combinaciones ganadoras y perdedoras ---
+        const comboStats = {};
+        for (const r of assetRows) {
+            const cwevBucket = r._cwev >= 7 ? 'hiCWEV' : 'loCWEV';
+            const alphaBucket = r._alpha >= 0.035 ? 'hiAlpha' : 'loAlpha';
+            const edgeBucket = Math.abs(r._edge) >= 8 ? 'hiEdge' : 'loEdge';
+            const lobAligned = (r.Dir === 'BUY' && r._lob > 0) || (r.Dir === 'SELL' && r._lob < 0) ? 'lobOK' : 'lobBAD';
+            const stabBucket = r._stab >= 80 ? 'hiStab' : 'loStab';
+            const tf = r.TF || '?';
+
+            const fingerprints = [
+                `${cwevBucket}+${alphaBucket}`,
+                `${cwevBucket}+${lobAligned}`,
+                `${edgeBucket}+${alphaBucket}`,
+                `${tf}+${cwevBucket}`,
+                `${stabBucket}+${cwevBucket}`,
+                `${tf}+${lobAligned}`,
+                `${cwevBucket}+${alphaBucket}+${lobAligned}`,
+                `${tf}+${cwevBucket}+${alphaBucket}`
+            ];
+
+            for (const fp of fingerprints) {
+                if (!comboStats[fp]) comboStats[fp] = { w: 0, l: 0 };
+                if (r._win === 1) comboStats[fp].w++;
+                else comboStats[fp].l++;
+            }
+        }
+
+        for (const [fp, stats] of Object.entries(comboStats)) {
+            const total = stats.w + stats.l;
+            if (total < 5) continue;
+            const wr = (stats.w / total) * 100;
+            if (wr < 40) {
+                profile.losingCombos.push({ fingerprint: fp, wr: Math.round(wr), n: total });
+            } else if (wr >= 60) {
+                profile.winningCombos.push({ fingerprint: fp, wr: Math.round(wr), n: total });
+            }
+        }
+
+        // Ordenar por peor WR primero (más peligrosas arriba)
+        profile.losingCombos.sort((a, b) => a.wr - b.wr);
+        profile.winningCombos.sort((a, b) => b.wr - a.wr);
+
         profiles[assetId] = profile;
     }
 
     return profiles;
 }
 
+/**
+ * Actualiza las 3 estructuras de memoria dinámica desde los datos resueltos del CSV.
+ * Se llama en cada scan tras parsear el CSV.
+ */
+function updateMemoryFromCSV(resolvedRows) {
+    // ── Capa 1: LOSS_STREAKS por activo ──
+    for (const market of CONFIG.MARKETS) {
+        LOSS_STREAKS[market.id] = 0;
+    }
+    // Recorrer en orden cronológico
+    for (const r of resolvedRows) {
+        const asset = r.Activo;
+        if (!asset) continue;
+        if (r.Veredicto === 'PERDIDA' || r._win === 0) {
+            LOSS_STREAKS[asset] = (LOSS_STREAKS[asset] || 0) + 1;
+        } else if (r.Veredicto === 'GANADA' || r._win === 1) {
+            LOSS_STREAKS[asset] = 0;
+        }
+    }
+
+    // ── Capa 3: RECENT_FAILURE_PATTERNS desde pérdidas recientes ──
+    RECENT_FAILURE_PATTERNS.length = 0; // Limpiar sin reasignar referencia
+    const recentLosses = resolvedRows.filter(r => r._win === 0).slice(-50);
+    for (const r of recentLosses) {
+        const cwevRound = Math.round(r._cwev || 0);
+        const patternKey = `${r.TF || '?'}_${r.Dir || '?'}_${cwevRound}`;
+        if (!RECENT_FAILURE_PATTERNS.includes(patternKey)) {
+            RECENT_FAILURE_PATTERNS.push(patternKey);
+        }
+    }
+    // FIFO: mantener máximo 50
+    while (RECENT_FAILURE_PATTERNS.length > 50) {
+        RECENT_FAILURE_PATTERNS.shift();
+    }
+
+    // Actualizar cache global
+    RESOLVED_ROWS_CACHE = resolvedRows;
+}
+
+/**
+ * Capa 2: Calcula riesgo oculto basado en similitud con trades históricos.
+ * Busca trades pasados con condiciones numéricas similares y calcula
+ * qué porcentaje de esos terminaron en pérdida.
+ * Retorna 0-100 (0 = sin riesgo, 100 = máximo riesgo).
+ */
+function calculateHiddenRisk(signal, resolvedRows) {
+    if (!resolvedRows || resolvedRows.length === 0) return 0;
+    if (!signal || !signal.analysis) return 0;
+
+    const cwev = signal.analysis.cwev;
+    const alpha = signal.analysis.acs;
+    const edge = signal.analysis.edge;
+
+    // Tolerancias para definir "similar"
+    const similar = resolvedRows.filter(r => {
+        if (r.Activo !== signal.assetId) return false;
+        if (Math.abs((r._cwev || 0) - cwev) >= 2) return false;
+        if (Math.abs((r._alpha || 0) - alpha) >= 0.01) return false;
+        if (Math.abs((r._edge || 0) - edge) >= 2) return false;
+        return true;
+    });
+
+    if (similar.length < 5) return 0;
+
+    const losses = similar.filter(r => r._win === 0).length;
+    return (losses / similar.length) * 100;
+}
+
+/**
+ * Genera las fingerprints de combinación de una señal para compararlas
+ * contra los combos ganadores/perdedores del perfil del activo.
+ */
+function getSignalFingerprints(signal) {
+    const cwevBucket = signal.analysis.cwev >= 7 ? 'hiCWEV' : 'loCWEV';
+    const alphaBucket = signal.analysis.acs >= 0.035 ? 'hiAlpha' : 'loAlpha';
+    const edgeBucket = Math.abs(signal.analysis.edge) >= 8 ? 'hiEdge' : 'loEdge';
+    const lobAligned = (signal.analysis.direction === 'BUY' && signal.obi > 0) ||
+                       (signal.analysis.direction === 'SELL' && signal.obi < 0) ? 'lobOK' : 'lobBAD';
+    const stabBucket = (signal.analysis.stability * 100) >= 80 ? 'hiStab' : 'loStab';
+    const tf = signal.tf || '?';
+
+    return [
+        `${cwevBucket}+${alphaBucket}`,
+        `${cwevBucket}+${lobAligned}`,
+        `${edgeBucket}+${alphaBucket}`,
+        `${tf}+${cwevBucket}`,
+        `${stabBucket}+${cwevBucket}`,
+        `${tf}+${lobAligned}`,
+        `${cwevBucket}+${alphaBucket}+${lobAligned}`,
+        `${tf}+${cwevBucket}+${alphaBucket}`
+    ];
+}
+
+/**
+ * evaluateHiddenRisk(signal, profile)
+ *
+ * Calcula un riskScore interno (0–100) basado en:
+ *   1. Win rate histórico del activo
+ *   2. Rachas de pérdida (actual y tendencia)
+ *   3. Coincidencia con patrones/combos perdedores del CSV
+ *   4. Contexto actual (LOB, Momentum, Stability)
+ *
+ * Retorna { riskScore, riskFactors[] }
+ */
+function evaluateHiddenRisk(signal, profile) {
+    const factors = [];
+    let riskScore = 0;
+
+    // ── 1. Win Rate histórico del activo ──
+    // WR bajo = riesgo base alto
+    if (profile.overallWR < 42) {
+        const wrPenalty = Math.min(25, Math.round((50 - profile.overallWR) * 2));
+        riskScore += wrPenalty;
+        factors.push(`WR bajo: ${profile.overallWR.toFixed(1)}% (+${wrPenalty})`);
+    } else if (profile.overallWR < 48) {
+        const wrPenalty = Math.min(12, Math.round((50 - profile.overallWR) * 1.5));
+        riskScore += wrPenalty;
+        factors.push(`WR mediocre: ${profile.overallWR.toFixed(1)}% (+${wrPenalty})`);
+    }
+
+    // ── 2. Rachas de pérdidas consecutivas ──
+    // Racha actual activa = peligro inmediato
+    if (profile.currentLossStreak >= 4) {
+        riskScore += 30;
+        factors.push(`Racha activa: ${profile.currentLossStreak} pérdidas (+30)`);
+    } else if (profile.currentLossStreak >= 3) {
+        riskScore += 20;
+        factors.push(`Racha activa: ${profile.currentLossStreak} pérdidas (+20)`);
+    } else if (profile.currentLossStreak >= 2) {
+        riskScore += 8;
+        factors.push(`Racha menor: ${profile.currentLossStreak} pérdidas (+8)`);
+    }
+
+    // Historial de rachas largas = activo propenso a rachas
+    if (profile.streaks3Plus >= 3) {
+        riskScore += 12;
+        factors.push(`${profile.streaks3Plus} rachas de 3+ pérdidas (+12)`);
+    } else if (profile.streaks3Plus >= 2) {
+        riskScore += 6;
+        factors.push(`${profile.streaks3Plus} rachas de 3+ pérdidas (+6)`);
+    }
+
+    // Racha máxima histórica muy alta = activo inestable
+    if (profile.maxLossStreak >= 5) {
+        riskScore += 8;
+        factors.push(`Max racha histórica: ${profile.maxLossStreak} (+8)`);
+    }
+
+    // ── 3. Coincidencia con patrones perdedores del CSV ──
+    const signalFPs = getSignalFingerprints(signal);
+    let losingMatchCount = 0;
+    let worstLosingWR = 100;
+    let losingMatchDetails = [];
+
+    for (const fp of signalFPs) {
+        // Buscar en combos perdedores
+        const losingMatch = profile.losingCombos.find(c => c.fingerprint === fp);
+        if (losingMatch) {
+            losingMatchCount++;
+            if (losingMatch.wr < worstLosingWR) {
+                worstLosingWR = losingMatch.wr;
+            }
+            losingMatchDetails.push(`${fp}:${losingMatch.wr}%`);
+        }
+    }
+
+    // Penalización escalonada por cantidad de combos perdedores que coinciden
+    if (losingMatchCount >= 5) {
+        // Señal coincide con muchos patrones perdedores → riesgo muy alto
+        const comboPenalty = Math.min(35, 15 + (losingMatchCount * 3));
+        riskScore += comboPenalty;
+        factors.push(`${losingMatchCount} combos perdedores (peor: ${worstLosingWR}%) (+${comboPenalty})`);
+    } else if (losingMatchCount >= 3) {
+        const comboPenalty = Math.min(22, 8 + (losingMatchCount * 3));
+        riskScore += comboPenalty;
+        factors.push(`${losingMatchCount} combos perdedores (peor: ${worstLosingWR}%) (+${comboPenalty})`);
+    } else if (losingMatchCount >= 1) {
+        const comboPenalty = 5 * losingMatchCount;
+        riskScore += comboPenalty;
+        factors.push(`${losingMatchCount} combo perdedor (${losingMatchDetails.join(', ')}) (+${comboPenalty})`);
+    }
+
+    // Bonus negativo si coincide con combos ganadores
+    let winningMatchCount = 0;
+    for (const fp of signalFPs) {
+        const winningMatch = profile.winningCombos.find(c => c.fingerprint === fp);
+        if (winningMatch) winningMatchCount++;
+    }
+    if (winningMatchCount >= 3) {
+        const bonus = Math.min(15, winningMatchCount * 3);
+        riskScore -= bonus;
+        factors.push(`${winningMatchCount} combos ganadores (-${bonus})`);
+    }
+
+    // ── 4. Contexto actual (LOB, Momentum, Stability) ──
+    // Momentum contra dirección = riesgo adicional
+    const isB = signal.analysis.direction === 'BUY';
+    if (signal.momentumSlope !== undefined) {
+        if ((isB && signal.momentumSlope < -0.0005) || (!isB && signal.momentumSlope > 0.0005)) {
+            riskScore += 8;
+            factors.push(`Momentum fuerte contra dirección (+8)`);
+        }
+    }
+
+    // LOB desalineado
+    if ((isB && signal.obi < -0.1) || (!isB && signal.obi > 0.1)) {
+        riskScore += 6;
+        factors.push(`LOB desalineado (+6)`);
+    }
+
+    // Stability muy baja combinada con edge alto = sobreconfianza peligrosa
+    if (signal.analysis.stability < 0.50 && signal.analysis.cwev >= 8) {
+        riskScore += 10;
+        factors.push(`Baja estabilidad + CWEV alto (+10)`);
+    }
+
+    // Clamping final
+    riskScore = Math.max(0, Math.min(100, riskScore));
+
+    return { riskScore, riskFactors: factors };
+}
+
 function applyAdaptiveFilter(signal) {
     const profile = ADAPTIVE_PROFILES[signal.assetId];
     if (!profile || profile.confidence === 'LOW') {
-        return { pass: true, reason: 'Sin datos suficientes', adjustedScore: 100 };
+        return { pass: true, reason: 'Sin datos suficientes', adjustedScore: 100, riskScore: 0, riskFactors: [] };
     }
 
     const reasons = [];
     let penalty = 0;
 
+    // --- Filtros existentes (sin modificar) ---
     if (signal.analysis.cwev >= profile.maxCWEV) {
         reasons.push(`CWEV ${signal.analysis.cwev.toFixed(1)} >= ${profile.maxCWEV}`);
         penalty += 20;
@@ -258,12 +561,57 @@ function applyAdaptiveFilter(signal) {
         penalty += 30;
     }
 
+    // --- Integración de evaluateHiddenRisk ---
+    const { riskScore, riskFactors } = evaluateHiddenRisk(signal, profile);
+
+    if (riskScore > 60) {
+        reasons.push(`RIESGO OCULTO ALTO: ${riskScore}/100`);
+        penalty = 100;
+    } else if (riskScore >= 40) {
+        const extraPenalty = Math.round((riskScore - 40) * 0.75);
+        penalty += extraPenalty;
+        reasons.push(`Riesgo moderado: ${riskScore}/100 (+${extraPenalty})`);
+    }
+
+    // ── CAPA 1: Memoria de racha por activo ──
+    const currentStreak = LOSS_STREAKS[signal.assetId] || 0;
+    if (currentStreak >= 4) {
+        penalty += 35;
+        reasons.push(`Racha crítica: ${currentStreak} pérdidas (+35)`);
+    } else if (currentStreak >= 3) {
+        penalty += 25;
+        reasons.push(`Racha activa: ${currentStreak} pérdidas (+25)`);
+    } else if (currentStreak >= 2) {
+        penalty += 15;
+        reasons.push(`Racha menor: ${currentStreak} pérdidas (+15)`);
+    }
+
+    // ── CAPA 2: Riesgo oculto por similitud numérica ──
+    const hiddenRisk = calculateHiddenRisk(signal, RESOLVED_ROWS_CACHE);
+    if (hiddenRisk > 60) {
+        penalty += 40;
+        reasons.push(`Similitud con pérdidas: ${hiddenRisk.toFixed(1)}% (+40)`);
+    } else if (hiddenRisk > 45) {
+        penalty += 20;
+        reasons.push(`Similitud moderada: ${hiddenRisk.toFixed(1)}% (+20)`);
+    }
+
+    // ── CAPA 3: Memoria de patrones fallidos recientes ──
+    const cwevRound = Math.round(signal.analysis.cwev || 0);
+    const patternKey = `${signal.tf}_${signal.analysis.direction}_${cwevRound}`;
+    if (RECENT_FAILURE_PATTERNS.includes(patternKey)) {
+        penalty += 30;
+        reasons.push(`Patrón fallido reciente: ${patternKey} (+30)`);
+    }
+
     const pass = penalty < 40;
     return {
         pass,
         reason: reasons.length > 0 ? reasons.join(' | ') : 'OK',
         adjustedScore: Math.max(0, 100 - penalty),
-        penalty
+        penalty,
+        riskScore,
+        riskFactors
     };
 }
 
@@ -282,6 +630,26 @@ function getAssetLearningContext(assetId) {
     }
     if (profile.lobBias > 3) {
         ctx += `- LOB alineado mejora WR en +${profile.lobBias.toFixed(1)}%\n`;
+    }
+
+    // Información de rachas
+    if (profile.currentLossStreak >= 2) {
+        ctx += `- ⚠️ RACHA ACTIVA: ${profile.currentLossStreak} pérdidas consecutivas\n`;
+    }
+    if (profile.maxLossStreak >= 4) {
+        ctx += `- Racha máxima histórica: ${profile.maxLossStreak} pérdidas\n`;
+    }
+
+    // Top combos perdedores
+    if (profile.losingCombos.length > 0) {
+        const topLosing = profile.losingCombos.slice(0, 3);
+        ctx += `- Combos tóxicos: ${topLosing.map(c => `${c.fingerprint}(${c.wr}% WR, ${c.n}t)`).join(', ')}\n`;
+    }
+
+    // Top combos ganadores
+    if (profile.winningCombos.length > 0) {
+        const topWinning = profile.winningCombos.slice(0, 3);
+        ctx += `- Combos rentables: ${topWinning.map(c => `${c.fingerprint}(${c.wr}% WR, ${c.n}t)`).join(', ')}\n`;
     }
 
     return ctx;
@@ -827,8 +1195,17 @@ bot.onText(/\/profile/, async (msg) => {
             text += `\n*${assetId}* (${p.totalTrades}t, WR: ${p.overallWR.toFixed(1)}%)`;
             text += `\nCWEV<${p.maxCWEV} | Alpha<${p.maxAlpha} | |Edge|<${p.maxAbsEdge}`;
             text += `\nTFs: ${p.preferredTFs.join(', ')} | ${p.confidence}`;
+            if (p.currentLossStreak >= 2) {
+                text += `\n🔴 Racha activa: ${p.currentLossStreak} pérdidas`;
+            }
+            if (p.losingCombos.length > 0) {
+                text += `\n⚠️ ${p.losingCombos.length} combos tóxicos`;
+            }
+            if (p.winningCombos.length > 0) {
+                text += `\n✅ ${p.winningCombos.length} combos rentables`;
+            }
             if (p.lossPatterns.length > 0) {
-                text += `\n⚠️ ${p.lossPatterns[0]}`;
+                text += `\n📉 ${p.lossPatterns[0]}`;
             }
             text += '\n';
         }
@@ -941,6 +1318,7 @@ async function globalScan(scanType = 'auto') {
     CURRENT_WINNING_ZONES = buildWinningZonesFromCSV(parsedData);
     const resolvedRows = parseCSVResolved();
     ADAPTIVE_PROFILES = buildAdaptiveProfiles(resolvedRows);
+    updateMemoryFromCSV(resolvedRows);
 
     // Selección dinámica de activos
     let allowedAssets = CONFIG.MARKETS.map(m => m.id);
@@ -1113,14 +1491,20 @@ async function globalScan(scanType = 'auto') {
         if (!passMomentumAgr) isAggressive = false;
 
         if (isElite || isAggressive) {
-            // --- FILTRO ADAPTATIVO ---
+            // --- FILTRO ADAPTATIVO + HIDDEN RISK ---
             const adaptiveResult = applyAdaptiveFilter(s);
             s.adaptiveScore = adaptiveResult.adjustedScore;
             s.adaptiveReason = adaptiveResult.reason;
             s.adaptivePass = adaptiveResult.pass;
+            s.riskScore = adaptiveResult.riskScore;
+            s.riskFactors = adaptiveResult.riskFactors;
 
             if (!adaptiveResult.pass) {
-                console.log(`[FILTRO] ${s.assetId} ${s.tf} bloqueada: ${adaptiveResult.reason}`);
+                const riskDetail = adaptiveResult.riskScore > 0 ? ` | RiskScore: ${adaptiveResult.riskScore}/100` : '';
+                console.log(`[FILTRO] ${s.assetId} ${s.tf} bloqueada: ${adaptiveResult.reason}${riskDetail}`);
+                if (adaptiveResult.riskFactors.length > 0) {
+                    console.log(`  → Factores: ${adaptiveResult.riskFactors.join(', ')}`);
+                }
                 continue;
             }
 
@@ -1301,6 +1685,22 @@ setInterval(async () => {
                     iaScore: audit.logData.iaScore, iaContext: audit.logData.iaContext, mode: audit.logData.mode,
                     veredicto: iconResult, open: openPrice, close: closePrice
                 });
+
+                // ── Actualización en tiempo real de memoria dinámica ──
+                if (iconResult === 'PERDIDA') {
+                    LOSS_STREAKS[audit.assetId] = (LOSS_STREAKS[audit.assetId] || 0) + 1;
+                    // Agregar patrón fallido
+                    const cwevRound = Math.round(parseFloat(audit.logData.cwev) || 0);
+                    const failKey = `${audit.tf}_${audit.direction}_${cwevRound}`;
+                    if (!RECENT_FAILURE_PATTERNS.includes(failKey)) {
+                        RECENT_FAILURE_PATTERNS.push(failKey);
+                        while (RECENT_FAILURE_PATTERNS.length > 50) {
+                            RECENT_FAILURE_PATTERNS.shift();
+                        }
+                    }
+                } else if (iconResult === 'GANADA') {
+                    LOSS_STREAKS[audit.assetId] = 0;
+                }
 
                 PENDING_AUDITS.splice(i, 1);
             } catch (error) { audit.retries++; }
