@@ -2,12 +2,15 @@ require('dotenv').config();
 
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-// FIX: Doble import — fs sync solo para existsSync, fsPromises para todo lo demás (no-bloqueante)
-const fs = require('fs');
-const fsPromises = require('fs').promises;
+// INTEGRATION: Motor adaptativo evolutivo
+const adaptive = require('./adaptiveEngine');
+// INTEGRATION: Capa de persistencia Supabase (reemplaza CSV)
+const db = require('./db');
+// INTEGRATION: Persistencia de estado adaptativo
+const adaptivePersistence = require('./adaptivePersistence');
 
 // ═══════════════════════════════════════════════════════════════════
-// QUANT SNIPER V13 — ADAPTIVE TACTICAL PRO (PRODUCTION BUILD)
+// QUANT SNIPER V15 — SUPABASE PERSISTENT (PRODUCTION)
 // ═══════════════════════════════════════════════════════════════════
 
 // === CONFIGURACIONES GLOBALES ===
@@ -17,8 +20,11 @@ const bot = new TelegramBot(token, { polling: true });
 
 const patternLength = 6;
 const PROB_THRESHOLD = 54;
-// IMPROVEMENT: Límite de memoria dinámica para CSV
-const MAX_CSV_ROWS = 500;
+
+// LOCK: Evita scans simultáneos
+let isScanning = false;
+// LOCK: Evita doble ejecución de IA por señal
+const IA_IN_PROGRESS = new Set();
 
 const CONFIG = {
     BE: 54.94,
@@ -65,54 +71,10 @@ let RESOLVED_ROWS_CACHE = [];                           // Cache de filas resuel
 
 
 // ═══════════════════════════════════════════════════════════════════
-// MÓDULO 1: SISTEMA DE APRENDIZAJE ADAPTATIVO (CSV INTELLIGENCE)
+// MÓDULO 1: SISTEMA DE APRENDIZAJE ADAPTATIVO (SUPABASE INTELLIGENCE)
 // ═══════════════════════════════════════════════════════════════════
 
 let ADAPTIVE_PROFILES = {};
-
-// FIX: Convertida a async — ya no bloquea el event loop con readFileSync
-async function parseCSVResolved() {
-    const filePath = './auditoria_sniper.csv';
-    try {
-        await fsPromises.access(filePath);
-    } catch {
-        return [];
-    }
-
-    try {
-        const content = await fsPromises.readFile(filePath, 'utf8');
-        const lines = content.split('\n').filter(l => l.trim() !== '');
-        if (lines.length < 2) return [];
-
-        const headers = lines[0].split(',').map(h => h.trim());
-        const rows = [];
-
-        // IMPROVEMENT: Solo procesar las últimas MAX_CSV_ROWS filas para memoria acotada
-        const startLine = Math.max(1, lines.length - MAX_CSV_ROWS);
-        for (let i = startLine; i < lines.length; i++) {
-            const vals = lines[i].split(',');
-            const obj = {};
-            headers.forEach((h, idx) => { obj[h] = (vals[idx] || '').trim(); });
-
-            if (obj.Veredicto === 'GANADA' || obj.Veredicto === 'PERDIDA') {
-                obj._prob = parseFloat(obj.Prob) || 0;
-                obj._lob = parseFloat(obj.LOB) || 0;
-                obj._edge = parseFloat(obj.Edge) || 0;
-                obj._stab = parseFloat(obj.Stability) || 0;
-                obj._cwev = parseFloat(obj.CWEV) || 0;
-                obj._alpha = parseFloat(obj.Alpha) || 0;
-                obj._samples = parseFloat(obj.Samples) || 0;
-                obj._win = obj.Veredicto === 'GANADA' ? 1 : 0;
-                rows.push(obj);
-            }
-        }
-        return rows;
-    } catch (e) {
-        // SAFETY: Loggear error de CSV sin romper ejecución
-        console.error('[CSV_PARSE]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
-        return [];
-    }
-}
 
 function calcWR(subset) {
     if (!subset || subset.length < 3) return { wr: null, n: subset ? subset.length : 0 };
@@ -674,36 +636,6 @@ function getLocalTime() {
 
 
 // ═══════════════════════════════════════════════════════════════════
-// MÓDULO 3: LOGGING CSV (ASYNC — NO BLOQUEA EVENT LOOP)
-// ═══════════════════════════════════════════════════════════════════
-
-// FIX: logToCSV ahora es async y usa fsPromises — nunca bloquea el event loop
-async function logToCSV(data) {
-    const filePath = './auditoria_sniper.csv';
-    const now = new Date(getSyncedTime());
-    const fecha = now.toLocaleDateString('es-AR');
-    const hora = now.toLocaleTimeString('es-AR', { hour12: false });
-
-    try {
-        try {
-            await fsPromises.access(filePath);
-        } catch {
-            // FIX: Crear header con fsPromises.writeFile en vez de fs.writeFileSync
-            const header = 'Fecha,Hora,Activo,TF,Dir,Prob,LOB,Edge,Alpha,Stability,CWEV,Samples,Veredicto,Open,Close,IA_Verdict,IA_Score,IA_Context,Mode\n';
-            await fsPromises.writeFile(filePath, header);
-        }
-
-        const row = `${fecha},${hora},${data.asset || ''},${data.tf || ''},${data.dir || ''},${data.prob || ''},${data.lob || ''},${data.edge || ''},${data.alpha || ''},${data.stab || ''},${data.cwev || ''},${data.samples || ''},${data.veredicto || ''},${data.open || ''},${data.close || ''},${data.iaVerdict || ''},${data.iaScore || ''},${data.iaContext || ''},${data.mode || ''}\n`;
-        // FIX: appendFile async en vez de appendFileSync
-        await fsPromises.appendFile(filePath, row);
-    } catch (e) {
-        // SAFETY: Loggear fallo de escritura sin romper el bot
-        console.error('[CSV_WRITE]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
-    }
-}
-
-
-// ═══════════════════════════════════════════════════════════════════
 // MÓDULO 4: FUNCIONES DE TRADING (CFDs / QUANTFURY)
 // ═══════════════════════════════════════════════════════════════════
 
@@ -1111,6 +1043,13 @@ bot.on('callback_query', async (query) => {
     if (!data.startsWith('ia_')) return;
 
     const sigId = data.replace('ia_', '');
+
+    // LOCK: Evitar doble ejecución de IA para la misma señal
+    if (IA_IN_PROGRESS.has(sigId)) {
+        await bot.answerCallbackQuery(query.id, { text: '⏳ IA ya en proceso...', show_alert: false });
+        return;
+    }
+
     const signalData = SIGNAL_CACHE.get(sigId);
 
     if (!signalData) {
@@ -1119,6 +1058,7 @@ bot.on('callback_query', async (query) => {
     }
 
     await bot.answerCallbackQuery(query.id, { text: '🧠 Consultando IA...' });
+    IA_IN_PROGRESS.add(sigId);
 
     const originalMsg = signalData._messageText;
     try {
@@ -1135,6 +1075,7 @@ bot.on('callback_query', async (query) => {
     const iaResult = await executeIAAnalysis(sigId);
 
     if (!iaResult) {
+        IA_IN_PROGRESS.delete(sigId);
         try {
             await bot.editMessageText(originalMsg + '\n\n❌ _Fallo IA. Juzgar manualmente._', {
                 chat_id: chatId,
@@ -1164,8 +1105,8 @@ bot.on('callback_query', async (query) => {
         }
     }
 
-    const verdictIcon = iaResult.isExecute ? '🚀 EXECUTE' : '⛔ PASS';
-    const iaBlock = `\n\n🧠 *IA: ${verdictIcon}* (${iaResult.iaScore}/100)\n🧩 ${iaResult.iaContext}\n📝 _${iaResult.iaReasoning}_${tradingUpdate}`;
+    const verdictIcon = iaResult.isExecute ? '🚀 EXECUTE TRADE' : '❌ PASS';
+    const iaBlock = `\n\n*Veredicto IA:* ${verdictIcon} (Score: ${iaResult.iaScore}/100)${tradingUpdate}`;
 
     try {
         await bot.editMessageText(originalMsg + iaBlock, {
@@ -1177,16 +1118,14 @@ bot.on('callback_query', async (query) => {
         console.error('[TG_EDIT_IA]', { message: e.message, time: new Date().toISOString() });
     }
 
-    // FIX: logToCSV ahora es async, usar await
-    await logToCSV({
-        asset: signalData.assetId, tf: signalData.tf, dir: signalData.analysis.direction,
-        prob: signalData.analysis.prob.toFixed(1), lob: signalData.obi.toFixed(3),
-        edge: signalData.analysis.edge.toFixed(2), alpha: signalData.analysis.acs.toFixed(3),
-        stab: (signalData.analysis.stability * 100).toFixed(0), cwev: signalData.analysis.cwev.toFixed(1),
-        samples: signalData.analysis.n, veredicto: 'IA_ANALIZADA',
-        iaVerdict: iaResult.iaVerdict, iaScore: iaResult.iaScore,
-        iaContext: iaResult.iaContext, mode: signalData.modeString
+    // DB: Actualizar la fila existente con resultado IA (no insertar duplicado)
+    await db.updateTradeResult(sigId, {
+        veredicto: 'IA_ANALIZADA',
+        iaVerdict: iaResult.iaVerdict,
+        iaScore: iaResult.iaScore,
+        iaContext: iaResult.iaContext
     });
+    IA_IN_PROGRESS.delete(sigId);
 });
 
 
@@ -1196,7 +1135,7 @@ bot.on('callback_query', async (query) => {
 
 bot.onText(/\/start/, (msg) => {
     if (msg.chat.id.toString() === chatId) {
-        bot.sendMessage(chatId, '👋 *Quant Sniper V13 ADAPTIVE* operativo.\n🧠 Aprendizaje adaptativo + IA on-demand.\n\n/scan — Escaneo manual\n/profile — Perfiles adaptativos\n/stats — Estadísticas', { parse_mode: 'Markdown' });
+        bot.sendMessage(chatId, '👋 *Quant Sniper V15 SUPABASE* operativo.\n🧠 Motor adaptativo + RL + IA on-demand.\n\n/scan — Escaneo manual\n/profile — Perfiles adaptativos\n/stats — Estadísticas\n/analyze — Análisis adaptativo', { parse_mode: 'Markdown' });
     }
 });
 
@@ -1208,7 +1147,9 @@ bot.onText(/\/scan/, async (msg) => {
 
 bot.onText(/\/profile/, async (msg) => {
     if (msg.chat.id.toString() === chatId) {
-        const resolvedRows = await parseCSVResolved();
+        // DB: Cargar trades resueltos desde Supabase
+        const allRows = await db.getRecentTrades(1000);
+        const resolvedRows = allRows.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA');
         const profiles = buildAdaptiveProfiles(resolvedRows);
 
         let text = '📊 *PERFILES ADAPTATIVOS*\n';
@@ -1238,7 +1179,9 @@ bot.onText(/\/profile/, async (msg) => {
 
 bot.onText(/\/stats/, async (msg) => {
     if (msg.chat.id.toString() === chatId) {
-        const resolved = await parseCSVResolved();
+        // DB: Cargar trades resueltos desde Supabase
+        const allRows = await db.getRecentTrades(1000);
+        const resolved = allRows.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA');
         if (resolved.length === 0) {
             bot.sendMessage(chatId, '📊 Sin trades resueltos aún.');
             return;
@@ -1264,8 +1207,28 @@ bot.onText(/\/stats/, async (msg) => {
     }
 });
 
-console.log(`🤖 Quant Sniper V13 ADAPTIVE PROD iniciando...`);
-bot.sendMessage(chatId, '🟢 *Quant Sniper V13 ADAPTIVE PROD* encendido.\n🧠 Aprendizaje + IA on-demand\n📊 /profile /stats /scan', { parse_mode: 'Markdown' });
+console.log(`🤖 Quant Sniper V15 SUPABASE iniciando...`);
+
+// HYDRATION: Cargar estado adaptativo ANTES de procesar cualquier señal
+(async () => {
+    try {
+        const savedState = await adaptivePersistence.loadState();
+        adaptive.hydrateState(savedState);
+        console.log('[BOOT] Estado adaptativo hidratado desde Supabase');
+
+        // Bootstrap inicial desde trades en DB para sincronizar ASSET_STATS
+        const rows = await db.getRecentTrades(1000);
+        const resolved = rows.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA');
+        if (resolved.length > 0) {
+            adaptive.learnFromCSV(resolved, 'incremental');
+            console.log(`[BOOT] Stats sincronizados desde ${resolved.length} trades`);
+        }
+    } catch (e) {
+        console.error('[BOOT]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
+    }
+
+    bot.sendMessage(chatId, '🟢 *Quant Sniper V15 SUPABASE* encendido.\n🧠 RL persistente + Supabase + IA on-demand\n📊 /profile /stats /scan /analyze', { parse_mode: 'Markdown' });
+})();
 
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1273,6 +1236,15 @@ bot.sendMessage(chatId, '🟢 *Quant Sniper V13 ADAPTIVE PROD* encendido.\n🧠 
 // ═══════════════════════════════════════════════════════════════════
 
 async function globalScan(scanType = 'auto') {
+    // LOCK: Evita scans simultáneos
+    if (isScanning) {
+        console.log('[SCAN] Scan ya en progreso, ignorando.');
+        return;
+    }
+    isScanning = true;
+
+    try {
+    // ── Inicio de lógica de scan (intacta) ──
     const currentServerTime = getSyncedTime();
 
     if (currentServerTime < globalPauseUntil) {
@@ -1292,68 +1264,54 @@ async function globalScan(scanType = 'auto') {
         console.error('[TG_SCAN_MSG]', { message: e.message, time: new Date().toISOString() });
     }
 
-    // --- Cargar CSV y construir perfiles (ASYNC) ---
+    // --- Cargar datos desde Supabase y construir perfiles ---
     let parsedData = [];
     const assetPerformance = {};
     const candlesByAsset = {};
 
     try {
-        // FIX: Lectura async del CSV — no bloquea event loop
-        const filePath = './auditoria_sniper.csv';
-        let fileExists = false;
-        try { await fsPromises.access(filePath); fileExists = true; } catch {}
+        // DB: Cargar historial desde Supabase (reemplaza lectura CSV)
+        parsedData = await db.getRecentTrades(1000);
 
-        if (fileExists) {
-            const content = await fsPromises.readFile(filePath, 'utf8');
-            const lines = content.split('\n').filter(l => l.trim() !== '');
-            if (lines.length > 1) {
-                const headers = lines[0].split(',');
-                // IMPROVEMENT: Solo procesar últimas MAX_CSV_ROWS filas
-                const startLine = Math.max(1, lines.length - MAX_CSV_ROWS);
-                for (let i = startLine; i < lines.length; i++) {
-                    const vals = lines[i].split(',');
-                    let obj = {};
-                    headers.forEach((h, idx) => obj[h.trim()] = vals[idx]);
-                    parsedData.push(obj);
+        if (parsedData.length > 0) {
+            CONFIG.MARKETS.forEach(m => {
+                const assetRows = parsedData.filter(r => r.Activo === m.id && (r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA')).slice(-20);
+                if (assetRows.length > 0) {
+                    const wins = assetRows.filter(r => r.Veredicto === 'GANADA').length;
+                    assetPerformance[m.id] = { wr: (wins / assetRows.length * 100).toFixed(1), count: assetRows.length };
                 }
+            });
 
-                CONFIG.MARKETS.forEach(m => {
-                    const assetRows = parsedData.filter(r => r.Activo === m.id && (r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA')).slice(-20);
-                    if (assetRows.length > 0) {
-                        const wins = assetRows.filter(r => r.Veredicto === 'GANADA').length;
-                        assetPerformance[m.id] = { wr: (wins / assetRows.length * 100).toFixed(1), count: assetRows.length };
-                    }
-                });
+            // Circuit Breaker
+            const totalFinishedTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').length;
+            const globalLastTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').slice(-4);
 
-                // Circuit Breaker
-                const totalFinishedTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').length;
-                const globalLastTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').slice(-4);
+            if (globalLastTrades.length > 0 && globalLastTrades[globalLastTrades.length - 1].Veredicto === 'GANADA') {
+                circuitBreakerLevel = 0;
+            }
 
-                if (globalLastTrades.length > 0 && globalLastTrades[globalLastTrades.length - 1].Veredicto === 'GANADA') {
-                    circuitBreakerLevel = 0;
-                }
+            if (globalLastTrades.length === 4 && globalLastTrades.every(r => r.Veredicto === 'PERDIDA') && totalFinishedTrades > lastCircuitBreakerTradeCount) {
+                lastCircuitBreakerTradeCount = totalFinishedTrades;
+                const cooldownMinutes = 30 * Math.pow(2, Math.min(circuitBreakerLevel, 2));
+                globalPauseUntil = currentServerTime + (cooldownMinutes * 60 * 1000);
+                circuitBreakerLevel++;
 
-                if (globalLastTrades.length === 4 && globalLastTrades.every(r => r.Veredicto === 'PERDIDA') && totalFinishedTrades > lastCircuitBreakerTradeCount) {
-                    lastCircuitBreakerTradeCount = totalFinishedTrades;
-                    const cooldownMinutes = 30 * Math.pow(2, Math.min(circuitBreakerLevel, 2));
-                    globalPauseUntil = currentServerTime + (cooldownMinutes * 60 * 1000);
-                    circuitBreakerLevel++;
-
-                    bot.sendMessage(chatId, `🚨 *CIRCUIT BREAKER Nivel ${circuitBreakerLevel}*\n4 pérdidas consecutivas → Pausa ${cooldownMinutes}min`, { parse_mode: 'Markdown' });
-                    return;
-                }
+                bot.sendMessage(chatId, `🚨 *CIRCUIT BREAKER Nivel ${circuitBreakerLevel}*\n4 pérdidas consecutivas → Pausa ${cooldownMinutes}min`, { parse_mode: 'Markdown' });
+                return;
             }
         }
     } catch (e) {
-        // FIX: Error silencioso → loggear
-        console.error('[SCAN_CSV_LOAD]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
+        console.error('[SCAN_DB_LOAD]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
     }
 
-    // Construir zonas y perfiles adaptativos (parseCSVResolved ahora es async)
+    // Construir zonas y perfiles adaptativos (datos desde Supabase)
     CURRENT_WINNING_ZONES = buildWinningZonesFromCSV(parsedData);
-    const resolvedRows = await parseCSVResolved();
+    // DB: resolvedRows ya vienen con _win, _cwev, etc. precalculados desde db.getRecentTrades
+    const resolvedRows = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA');
     ADAPTIVE_PROFILES = buildAdaptiveProfiles(resolvedRows);
     updateMemoryFromCSV(resolvedRows);
+    // INTEGRATION 6.5: Aprendizaje adaptativo evolutivo
+    adaptive.learnFromCSV(resolvedRows);
 
     // Selección dinámica de activos
     let allowedAssets = CONFIG.MARKETS.map(m => m.id);
@@ -1512,7 +1470,9 @@ async function globalScan(scanType = 'auto') {
         if (!isB && momentumSlope > 0) isElite = false;
         if (isB && nearResistance) isElite = false;
         if (!isB && nearSupport) isElite = false;
-        if (s.analysis.prob < PROB_THRESHOLD) isElite = false;
+        // INTEGRATION 6.2: Usar threshold dinámico del motor adaptativo
+        const currentThreshold = adaptive.getDynamicThreshold();
+        if (s.analysis.prob < currentThreshold) isElite = false;
         if (s.analysis.acs < 0.015) isElite = false;
         if (s.analysis.stability < 0.40) isElite = false;
         if (s.analysis.n < 15) isElite = false;
@@ -1590,9 +1550,17 @@ async function globalScan(scanType = 'auto') {
                 scoreVisual = "0.4 → SOLO AGRESIVO";
             }
 
-            const confBar = makeProgressBar(s.analysis.prob);
-            const anticipationLevel = s.isAggressive ? 90 : 30;
-            const antBar = makeProgressBar(anticipationLevel);
+            // INTEGRATION 6.6: Ajuste adaptativo antes de emitir
+            const adaptiveResult = adaptive.computeAdaptiveAdjustment(
+                s.assetId, s.tf, s.analysis.direction, s.analysis.cwev,
+                candlesByAsset[s.assetId]
+            );
+
+            // Si el motor adaptativo bloquea este activo, saltear
+            if (adaptiveResult.blocked) {
+                console.log(`[ADAPTIVE] ${s.assetId} bloqueado: ${adaptiveResult.blockReason || 'ranking dinámico'} (hiddenRisk: ${adaptiveResult.hiddenRisk || 0})`);
+                continue;
+            }
 
             // Trade levels sin IA
             const tradeData = calculateTradeLevels(
@@ -1604,31 +1572,27 @@ async function globalScan(scanType = 'auto') {
                 circuitBreakerLevel
             );
 
-            // --- TARJETA SIMPLIFICADA ---
+            // --- UI SIMPLIFICADA (spec exacta) ---
             let msgText = `🎯 *${s.assetId} | ${s.tf}*\n\n`;
-            msgText += `*MODO DUAL*\n`;
-            msgText += `ELITE ${eliteCheck} → AGRESIVO ${agrCheck}\n`;
-            msgText += `🏆 *${scoreVisual}*\n\n`;
+            msgText += `MODO: E:${eliteCheck} → A:${agrCheck}\n`;
+            msgText += `🏆 ${scoreVisual}\n\n`;
             msgText += `${icon} *${s.analysis.direction}*\n\n`;
             msgText += `*BALANCE*\n`;
-            msgText += `Confianza:      ${confBar} (${s.analysis.prob.toFixed(0)}%)\n`;
-            msgText += `Anticipación: ${antBar} (${anticipationLevel}%)\n`;
 
             if (tradeData) {
-                msgText += `\n💰 *TRADING (Spot/CFD x20)*\n`;
+                msgText += `\n💰 *TRADING*\n`;
                 msgText += `📍 Entry: \`${tradeData.entry}\`\n`;
                 msgText += `🛑 SL: \`${tradeData.sl}\`\n`;
                 msgText += `🎯 TP: \`${tradeData.tp}\`\n`;
-                msgText += `⚖️ R:R: 1:${tradeData.rr}\n`;
-                msgText += `💼 Vol: ${tradeData.positionSize} USDT | Riesgo: ${tradeData.riskPercent}%`;
             }
 
-            msgText += `\n\n⏱️ Ventana: ${timeData.text}`;
+            msgText += `\n⏱️ Ventana: ${timeData.text}`;
 
-            // Guardar en cache
+            // Guardar en cache — INMUTABLE: spread para evitar mutación externa
             s.modeString = modeString;
             s.dualScore = dualScore;
             s._createdAt = Date.now();
+            s._adaptiveAdj = adaptiveResult;
 
             const sentMsg = await bot.sendMessage(chatId, msgText, {
                 parse_mode: 'Markdown',
@@ -1641,10 +1605,12 @@ async function globalScan(scanType = 'auto') {
 
             s._messageText = msgText;
             s._messageId = sentMsg.message_id;
-            SIGNAL_CACHE.set(sigId, s);
+            // CACHE INMUTABLE: copia profunda para que modificaciones externas no corrompan
+            SIGNAL_CACHE.set(sigId, { ...s, analysis: { ...s.analysis }, macro: { ...s.macro } });
 
-            // FIX: logToCSV ahora es async
-            await logToCSV({
+            // DB: Insertar señal con signal_id único (una sola fila por trade)
+            await db.insertTrade({
+                signalId: sigId,
                 asset: s.assetId, tf: s.tf, dir: s.analysis.direction,
                 prob: s.analysis.prob.toFixed(1), lob: s.obi.toFixed(3),
                 edge: s.analysis.edge.toFixed(2), alpha: s.analysis.acs.toFixed(3),
@@ -1671,6 +1637,11 @@ async function globalScan(scanType = 'auto') {
         bot.editMessageText(`💤 *Scan finalizado* ${endTime} — Sin señales`, {
             chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown'
         }).catch((e) => { console.error('[TG_EDIT_NOSIG]', { message: e.message, time: new Date().toISOString() }); });
+    }
+
+    } finally {
+        // LOCK: Liberar scan
+        isScanning = false;
     }
 }
 
@@ -1720,24 +1691,19 @@ setInterval(async () => {
                 const auditMsg = `${resultEmoji} *${audit.assetId}* ${audit.direction} → *${iconResult}*\nOpen: ${openPrice.toFixed(4)} | Close: ${closePrice.toFixed(4)}`;
                 await bot.sendMessage(chatId, auditMsg, { parse_mode: 'Markdown', reply_to_message_id: audit.messageId });
 
-                // FIX: logToCSV ahora es async
-                await logToCSV({
-                    asset: audit.assetId, tf: audit.tf, dir: audit.direction,
-                    prob: audit.logData.prob, lob: audit.logData.lob, edge: audit.logData.edge,
-                    alpha: audit.logData.alpha, stab: audit.logData.stab, cwev: audit.logData.cwev,
-                    samples: audit.logData.samples, iaVerdict: audit.logData.iaVerdict,
-                    iaScore: audit.logData.iaScore, iaContext: audit.logData.iaContext, mode: audit.logData.mode,
-                    veredicto: iconResult, open: openPrice, close: closePrice
+                // DB: Actualizar la fila existente (no insertar duplicado)
+                await db.updateTradeResult(audit.sigId, {
+                    veredicto: iconResult,
+                    open: openPrice,
+                    close: closePrice
                 });
 
                 // ── Actualización en tiempo real de memoria dinámica ──
+                const cwevRound = Math.round(parseFloat(audit.logData.cwev) || 0);
                 if (iconResult === 'PERDIDA') {
                     LOSS_STREAKS[audit.assetId] = (LOSS_STREAKS[audit.assetId] || 0) + 1;
-                    const cwevRound = Math.round(parseFloat(audit.logData.cwev) || 0);
                     const failKey = `${audit.tf}_${audit.direction}_${cwevRound}`;
-                    // IMPROVEMENT: Set .add() en vez de Array .push()
                     RECENT_FAILURE_PATTERNS.add(failKey);
-                    // IMPROVEMENT: FIFO con Set
                     if (RECENT_FAILURE_PATTERNS.size > 50) {
                         const arr = [...RECENT_FAILURE_PATTERNS];
                         RECENT_FAILURE_PATTERNS.clear();
@@ -1747,6 +1713,14 @@ setInterval(async () => {
                     }
                 } else if (iconResult === 'GANADA') {
                     LOSS_STREAKS[audit.assetId] = 0;
+                }
+
+                // INTEGRATION 6.5b: Registro en tiempo real en motor adaptativo
+                if (iconResult === 'GANADA' || iconResult === 'PERDIDA') {
+                    adaptive.recordTradeResult(
+                        audit.assetId, audit.tf, audit.direction,
+                        cwevRound, iconResult === 'GANADA'
+                    );
                 }
 
                 PENDING_AUDITS.splice(i, 1);
@@ -1769,3 +1743,41 @@ setInterval(() => {
         }
     }
 }, 30 * 60 * 1000);
+
+// DB: Rotación automática — mantener solo últimos 1000 trades (cada 6 horas)
+setInterval(() => {
+    db.cleanupOldTrades(1000);
+}, 6 * 60 * 60 * 1000);
+
+// Comando /analyze — Análisis adaptativo on-demand
+bot.onText(/\/analyze/, async (msg) => {
+    if (msg.chat.id.toString() === chatId) {
+        const waitMsg = await bot.sendMessage(chatId, '🧠 _Ejecutando análisis adaptativo..._', { parse_mode: 'Markdown' });
+        const summary = await db.runAdaptiveAnalysis(adaptive);
+
+        if (summary.trades === 0) {
+            bot.editMessageText('📊 Sin trades resueltos en DB.', { chat_id: chatId, message_id: waitMsg.message_id });
+            return;
+        }
+
+        let text = `🧠 *ANÁLISIS ADAPTATIVO*\n\n`;
+        text += `📊 Trades analizados: ${summary.trades}\n`;
+        text += `🎯 Threshold dinámico: ${summary.threshold}\n\n`;
+
+        if (summary.topAssets.length > 0) {
+            text += `🏆 *Top Assets:*\n`;
+            for (const a of summary.topAssets) {
+                text += `  ${a.asset}: ${a.wr}% WR (${a.trades}t)\n`;
+            }
+        }
+
+        if (summary.topPatterns.length > 0) {
+            text += `\n🧬 *Top Patrones RL:*\n`;
+            for (const p of summary.topPatterns) {
+                text += `  ${p.pattern}: score ${p.score} (${p.trades}t)\n`;
+            }
+        }
+
+        bot.editMessageText(text, { chat_id: chatId, message_id: waitMsg.message_id, parse_mode: 'Markdown' });
+    }
+});
