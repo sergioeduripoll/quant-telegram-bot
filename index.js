@@ -1349,11 +1349,35 @@ async function globalScan(scanType = 'auto') {
                 o: parseFloat(v[1]), h: parseFloat(v[2]), l: parseFloat(v[3]), c: parseFloat(v[4])
             }));
 
+            /**
+             * Carga paginada: Binance permite max 1000 por request.
+             * Hacemos N páginas hacia atrás con endTime para obtener
+             * suficiente historial para el pattern matching (necesita ~5000+).
+             */
+            async function fetchFullHistory(symbol, pages = 5) {
+                let allCandles = [];
+                let endTime = undefined;
+
+                for (let p = 0; p < pages; p++) {
+                    const params = `symbol=${symbol}&interval=5m&limit=1000${endTime ? `&endTime=${endTime - 1}` : ''}`;
+                    const res = await axios.get(`${CONFIG.BINANCE_API}/klines?${params}`);
+                    if (!res.data || res.data.length === 0) break;
+
+                    const mapped = mapKlines(res.data);
+                    allCandles = mapped.concat(allCandles); // Prepend (más viejas adelante)
+                    endTime = res.data[0][0]; // openTime de la vela más vieja de este batch
+
+                    if (res.data.length < 1000) break; // No hay más datos
+                    await new Promise(r => setTimeout(r, 300)); // Rate limit entre páginas
+                }
+                return allCandles;
+            }
+
             if (!historical) {
-                // Sin cache: pedir histórico completo directo a Binance
-                const histRes = await axios.get(`${CONFIG.BINANCE_API}/klines?symbol=${asset.symbolBinance}&interval=5m&limit=${CONFIG.REQUEST_LIMIT}`);
-                historical = mapKlines(histRes.data);
+                // Sin cache: cargar historial paginado (5 páginas = ~5000 velas = ~17 días)
+                historical = await fetchFullHistory(asset.symbolBinance, 5);
                 if (!historical || historical.length < 100) continue;
+                console.log(`[DATA] ${asset.id}: ${historical.length} velas cargadas desde Binance`);
                 GLOBAL_CANDLE_CACHE.set(asset.id, historical);
             } else {
                 // Con cache: pedir últimas 100 velas y mergear
@@ -1375,12 +1399,11 @@ async function globalScan(scanType = 'auto') {
                     if (overlapIdx !== -1 && overlapIdx < recentCandles.length - 1) {
                         historical.push(...recentCandles.slice(overlapIdx + 1));
                     } else if (overlapIdx === -1) {
-                        // Sin overlap: rebuild completo desde Binance
-                        const histRes = await axios.get(`${CONFIG.BINANCE_API}/klines?symbol=${asset.symbolBinance}&interval=5m&limit=${CONFIG.REQUEST_LIMIT}`);
-                        historical = mapKlines(histRes.data);
+                        // Sin overlap: rebuild completo paginado
+                        historical = await fetchFullHistory(asset.symbolBinance, 5);
                     }
 
-                    if (historical.length > 2000) historical = historical.slice(historical.length - 2000);
+                    if (historical.length > 6000) historical = historical.slice(historical.length - 6000);
                     GLOBAL_CANDLE_CACHE.set(asset.id, historical);
                 }
             }
