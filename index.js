@@ -1780,4 +1780,20 @@ bot.onText(/\/analyze/, async (msg) => {
 
         bot.editMessageText(text, { chat_id: chatId, message_id: waitMsg.message_id, parse_mode: 'Markdown' });
     }
+}); // <--- IMPORTANTE: Aquí cierra el comando /analyze
+
+// ═══════════════════════════════════════════════════════════════════
+// SHUTDOWN SEGURO (Manejo de deploy para evitar ETELEGRAM 409)
+// ═══════════════════════════════════════════════════════════════════
+
+process.once('SIGINT', () => {
+    console.log('[SYS] Deteniendo bot (SIGINT)...');
+    bot.stopPolling();
+    process.exit(0);
+});
+
+process.once('SIGTERM', () => {
+    console.log('[SYS] Deteniendo bot (SIGTERM) por deploy en DO...');
+    bot.stopPolling();
+    process.exit(0);
 });
