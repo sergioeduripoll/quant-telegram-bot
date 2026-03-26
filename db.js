@@ -106,6 +106,7 @@ async function getRecentTrades(limit = 1000) {
         const rows = (data || []).reverse();
 
         return rows.map(r => ({
+            signal_id: r.signal_id || null,
             Activo: r.asset,
             TF: r.tf,
             Dir: r.direction,
