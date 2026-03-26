@@ -30,7 +30,7 @@ const CONFIG = {
     BE: 54.94,
     BINANCE_API: 'https://api.binance.com/api/v3',
     BACKEND_URL: 'https://quant-backend-lhue.onrender.com/api',
-    REQUEST_LIMIT: 50000,
+    REQUEST_LIMIT: 2000,
     MARKETS: [
         { id: 'BTC/USD', symbolBinance: 'BTCUSDT' },
         { id: 'ETH/USD', symbolBinance: 'ETHUSDT' },
