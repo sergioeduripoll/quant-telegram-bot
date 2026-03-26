@@ -360,7 +360,7 @@ function computeAdaptiveAdjustment(asset, tf, direction, cwev, candles) {
     const hiddenRisk = clamp(negRL + negAsset + negContext, 0, 50);
 
     // Bloqueo compuesto: shouldFilterAsset O hiddenRisk alto
-    const finalBlocked = blocked || hiddenRisk > 30;
+    const finalBlocked = blocked || hiddenRisk > 45;
 
     return {
         totalAdjustment: clamp(totalAdjustment, -30, 30),
