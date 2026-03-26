@@ -1655,9 +1655,9 @@ setInterval(() => {
     const now = new Date(getSyncedTime());
     const m = now.getMinutes();
     const s = now.getSeconds();
-    // IMPROVEMENT: Ventana de 5 segundos (14-18) en vez de segundo exacto (15)
+    // TIMING: Dispara 1 minuto antes del cierre de vela 5M (minutos 4,9,14,19,24,29,34,39,44,49,54,59)
     // Protección: lastScanMinute evita disparos dobles
-    if ((m % 5 === 3) && s >= 14 && s <= 18 && lastScanMinute !== m) {
+    if ((m % 5 === 4) && s >= 0 && s <= 4 && lastScanMinute !== m) {
         lastScanMinute = m;
         globalScan('auto');
     }
@@ -1780,20 +1780,4 @@ bot.onText(/\/analyze/, async (msg) => {
 
         bot.editMessageText(text, { chat_id: chatId, message_id: waitMsg.message_id, parse_mode: 'Markdown' });
     }
-}); // <--- IMPORTANTE: Aquí cierra el comando /analyze
-
-// ═══════════════════════════════════════════════════════════════════
-// SHUTDOWN SEGURO (Manejo de deploy para evitar ETELEGRAM 409)
-// ═══════════════════════════════════════════════════════════════════
-
-process.once('SIGINT', () => {
-    console.log('[SYS] Deteniendo bot (SIGINT)...');
-    bot.stopPolling();
-    process.exit(0);
-});
-
-process.once('SIGTERM', () => {
-    console.log('[SYS] Deteniendo bot (SIGTERM) por deploy en DO...');
-    bot.stopPolling();
-    process.exit(0);
 });
