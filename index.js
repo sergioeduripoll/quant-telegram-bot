@@ -2,10 +2,12 @@ require('dotenv').config();
 
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
+// FIX: Doble import — fs sync solo para existsSync, fsPromises para todo lo demás (no-bloqueante)
 const fs = require('fs');
+const fsPromises = require('fs').promises;
 
 // ═══════════════════════════════════════════════════════════════════
-// QUANT SNIPER V13 — ADAPTIVE TACTICAL PRO
+// QUANT SNIPER V13 — ADAPTIVE TACTICAL PRO (PRODUCTION BUILD)
 // ═══════════════════════════════════════════════════════════════════
 
 // === CONFIGURACIONES GLOBALES ===
@@ -15,6 +17,8 @@ const bot = new TelegramBot(token, { polling: true });
 
 const patternLength = 6;
 const PROB_THRESHOLD = 54;
+// IMPROVEMENT: Límite de memoria dinámica para CSV
+const MAX_CSV_ROWS = 500;
 
 const CONFIG = {
     BE: 54.94,
@@ -54,9 +58,10 @@ let lastCircuitBreakerTradeCount = 0;
 const GLOBAL_CANDLE_CACHE = new Map();
 
 // ── Memoria Dinámica Adaptativa (3 capas) ──
-const LOSS_STREAKS = {};                        // Capa 1: racha actual por activo
-const RECENT_FAILURE_PATTERNS = [];             // Capa 3: patrones fallidos recientes (FIFO, max 50)
-let RESOLVED_ROWS_CACHE = [];                   // Cache de filas resueltas para capa 2
+const LOSS_STREAKS = {};                                // Capa 1: racha actual por activo
+// IMPROVEMENT: Set en lugar de Array para O(1) en .has() vs O(n) en .includes()
+const RECENT_FAILURE_PATTERNS = new Set();              // Capa 3: patrones fallidos recientes (max 50)
+let RESOLVED_ROWS_CACHE = [];                           // Cache de filas resueltas para capa 2
 
 
 // ═══════════════════════════════════════════════════════════════════
@@ -65,35 +70,48 @@ let RESOLVED_ROWS_CACHE = [];                   // Cache de filas resueltas para
 
 let ADAPTIVE_PROFILES = {};
 
-function parseCSVResolved() {
+// FIX: Convertida a async — ya no bloquea el event loop con readFileSync
+async function parseCSVResolved() {
     const filePath = './auditoria_sniper.csv';
-    if (!fs.existsSync(filePath)) return [];
-
-    const content = fs.readFileSync(filePath, 'utf8');
-    const lines = content.split('\n').filter(l => l.trim() !== '');
-    if (lines.length < 2) return [];
-
-    const headers = lines[0].split(',').map(h => h.trim());
-    const rows = [];
-
-    for (let i = 1; i < lines.length; i++) {
-        const vals = lines[i].split(',');
-        const obj = {};
-        headers.forEach((h, idx) => { obj[h] = (vals[idx] || '').trim(); });
-
-        if (obj.Veredicto === 'GANADA' || obj.Veredicto === 'PERDIDA') {
-            obj._prob = parseFloat(obj.Prob) || 0;
-            obj._lob = parseFloat(obj.LOB) || 0;
-            obj._edge = parseFloat(obj.Edge) || 0;
-            obj._stab = parseFloat(obj.Stability) || 0;
-            obj._cwev = parseFloat(obj.CWEV) || 0;
-            obj._alpha = parseFloat(obj.Alpha) || 0;
-            obj._samples = parseFloat(obj.Samples) || 0;
-            obj._win = obj.Veredicto === 'GANADA' ? 1 : 0;
-            rows.push(obj);
-        }
+    try {
+        await fsPromises.access(filePath);
+    } catch {
+        return [];
     }
-    return rows;
+
+    try {
+        const content = await fsPromises.readFile(filePath, 'utf8');
+        const lines = content.split('\n').filter(l => l.trim() !== '');
+        if (lines.length < 2) return [];
+
+        const headers = lines[0].split(',').map(h => h.trim());
+        const rows = [];
+
+        // IMPROVEMENT: Solo procesar las últimas MAX_CSV_ROWS filas para memoria acotada
+        const startLine = Math.max(1, lines.length - MAX_CSV_ROWS);
+        for (let i = startLine; i < lines.length; i++) {
+            const vals = lines[i].split(',');
+            const obj = {};
+            headers.forEach((h, idx) => { obj[h] = (vals[idx] || '').trim(); });
+
+            if (obj.Veredicto === 'GANADA' || obj.Veredicto === 'PERDIDA') {
+                obj._prob = parseFloat(obj.Prob) || 0;
+                obj._lob = parseFloat(obj.LOB) || 0;
+                obj._edge = parseFloat(obj.Edge) || 0;
+                obj._stab = parseFloat(obj.Stability) || 0;
+                obj._cwev = parseFloat(obj.CWEV) || 0;
+                obj._alpha = parseFloat(obj.Alpha) || 0;
+                obj._samples = parseFloat(obj.Samples) || 0;
+                obj._win = obj.Veredicto === 'GANADA' ? 1 : 0;
+                rows.push(obj);
+            }
+        }
+        return rows;
+    } catch (e) {
+        // SAFETY: Loggear error de CSV sin romper ejecución
+        console.error('[CSV_PARSE]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
+        return [];
+    }
 }
 
 function calcWR(subset) {
@@ -120,13 +138,13 @@ function buildAdaptiveProfiles(resolvedRows) {
             lobBias: 0,
             lossPatterns: [],
             confidence: 'LOW',
-            // Campos nuevos para evaluateHiddenRisk
+            // Campos para evaluateHiddenRisk
             currentLossStreak: 0,
             maxLossStreak: 0,
             avgLossStreak: 0,
             streaks3Plus: 0,
-            losingCombos: [],  // Array de { fingerprint, wr, n }
-            winningCombos: []  // Array de { fingerprint, wr, n }
+            losingCombos: [],
+            winningCombos: []
         };
 
         if (assetRows.length < 10) {
@@ -247,7 +265,7 @@ function buildAdaptiveProfiles(resolvedRows) {
         profile.avgLossStreak = allStreaks.length > 0 ? allStreaks.reduce((a, b) => a + b, 0) / allStreaks.length : 0;
         profile.streaks3Plus = allStreaks.filter(s => s >= 3).length;
 
-        // Racha actual (desde el final del historial)
+        // Racha actual
         let recentStreak = 0;
         for (let ri = assetRows.length - 1; ri >= 0; ri--) {
             if (assetRows[ri]._win === 0) recentStreak++;
@@ -294,7 +312,6 @@ function buildAdaptiveProfiles(resolvedRows) {
             }
         }
 
-        // Ordenar por peor WR primero (más peligrosas arriba)
         profile.losingCombos.sort((a, b) => a.wr - b.wr);
         profile.winningCombos.sort((a, b) => b.wr - a.wr);
 
@@ -306,14 +323,12 @@ function buildAdaptiveProfiles(resolvedRows) {
 
 /**
  * Actualiza las 3 estructuras de memoria dinámica desde los datos resueltos del CSV.
- * Se llama en cada scan tras parsear el CSV.
  */
 function updateMemoryFromCSV(resolvedRows) {
     // ── Capa 1: LOSS_STREAKS por activo ──
     for (const market of CONFIG.MARKETS) {
         LOSS_STREAKS[market.id] = 0;
     }
-    // Recorrer en orden cronológico
     for (const r of resolvedRows) {
         const asset = r.Activo;
         if (!asset) continue;
@@ -325,18 +340,21 @@ function updateMemoryFromCSV(resolvedRows) {
     }
 
     // ── Capa 3: RECENT_FAILURE_PATTERNS desde pérdidas recientes ──
-    RECENT_FAILURE_PATTERNS.length = 0; // Limpiar sin reasignar referencia
+    // IMPROVEMENT: Usar Set — clear() para limpiar, .add() para insertar, .has() para buscar
+    RECENT_FAILURE_PATTERNS.clear();
     const recentLosses = resolvedRows.filter(r => r._win === 0).slice(-50);
     for (const r of recentLosses) {
         const cwevRound = Math.round(r._cwev || 0);
         const patternKey = `${r.TF || '?'}_${r.Dir || '?'}_${cwevRound}`;
-        if (!RECENT_FAILURE_PATTERNS.includes(patternKey)) {
-            RECENT_FAILURE_PATTERNS.push(patternKey);
-        }
+        RECENT_FAILURE_PATTERNS.add(patternKey);
     }
-    // FIFO: mantener máximo 50
-    while (RECENT_FAILURE_PATTERNS.length > 50) {
-        RECENT_FAILURE_PATTERNS.shift();
+    // IMPROVEMENT: FIFO con Set — si supera 50, convertir a array, recortar, reconstruir
+    if (RECENT_FAILURE_PATTERNS.size > 50) {
+        const arr = [...RECENT_FAILURE_PATTERNS];
+        RECENT_FAILURE_PATTERNS.clear();
+        for (const item of arr.slice(-50)) {
+            RECENT_FAILURE_PATTERNS.add(item);
+        }
     }
 
     // Actualizar cache global
@@ -345,9 +363,6 @@ function updateMemoryFromCSV(resolvedRows) {
 
 /**
  * Capa 2: Calcula riesgo oculto basado en similitud con trades históricos.
- * Busca trades pasados con condiciones numéricas similares y calcula
- * qué porcentaje de esos terminaron en pérdida.
- * Retorna 0-100 (0 = sin riesgo, 100 = máximo riesgo).
  */
 function calculateHiddenRisk(signal, resolvedRows) {
     if (!resolvedRows || resolvedRows.length === 0) return 0;
@@ -357,7 +372,6 @@ function calculateHiddenRisk(signal, resolvedRows) {
     const alpha = signal.analysis.acs;
     const edge = signal.analysis.edge;
 
-    // Tolerancias para definir "similar"
     const similar = resolvedRows.filter(r => {
         if (r.Activo !== signal.assetId) return false;
         if (Math.abs((r._cwev || 0) - cwev) >= 2) return false;
@@ -373,8 +387,7 @@ function calculateHiddenRisk(signal, resolvedRows) {
 }
 
 /**
- * Genera las fingerprints de combinación de una señal para compararlas
- * contra los combos ganadores/perdedores del perfil del activo.
+ * Genera las fingerprints de combinación de una señal.
  */
 function getSignalFingerprints(signal) {
     const cwevBucket = signal.analysis.cwev >= 7 ? 'hiCWEV' : 'loCWEV';
@@ -398,22 +411,13 @@ function getSignalFingerprints(signal) {
 }
 
 /**
- * evaluateHiddenRisk(signal, profile)
- *
- * Calcula un riskScore interno (0–100) basado en:
- *   1. Win rate histórico del activo
- *   2. Rachas de pérdida (actual y tendencia)
- *   3. Coincidencia con patrones/combos perdedores del CSV
- *   4. Contexto actual (LOB, Momentum, Stability)
- *
- * Retorna { riskScore, riskFactors[] }
+ * evaluateHiddenRisk — riskScore interno (0-100)
  */
 function evaluateHiddenRisk(signal, profile) {
     const factors = [];
     let riskScore = 0;
 
     // ── 1. Win Rate histórico del activo ──
-    // WR bajo = riesgo base alto
     if (profile.overallWR < 42) {
         const wrPenalty = Math.min(25, Math.round((50 - profile.overallWR) * 2));
         riskScore += wrPenalty;
@@ -425,7 +429,6 @@ function evaluateHiddenRisk(signal, profile) {
     }
 
     // ── 2. Rachas de pérdidas consecutivas ──
-    // Racha actual activa = peligro inmediato
     if (profile.currentLossStreak >= 4) {
         riskScore += 30;
         factors.push(`Racha activa: ${profile.currentLossStreak} pérdidas (+30)`);
@@ -437,7 +440,6 @@ function evaluateHiddenRisk(signal, profile) {
         factors.push(`Racha menor: ${profile.currentLossStreak} pérdidas (+8)`);
     }
 
-    // Historial de rachas largas = activo propenso a rachas
     if (profile.streaks3Plus >= 3) {
         riskScore += 12;
         factors.push(`${profile.streaks3Plus} rachas de 3+ pérdidas (+12)`);
@@ -446,7 +448,6 @@ function evaluateHiddenRisk(signal, profile) {
         factors.push(`${profile.streaks3Plus} rachas de 3+ pérdidas (+6)`);
     }
 
-    // Racha máxima histórica muy alta = activo inestable
     if (profile.maxLossStreak >= 5) {
         riskScore += 8;
         factors.push(`Max racha histórica: ${profile.maxLossStreak} (+8)`);
@@ -459,7 +460,6 @@ function evaluateHiddenRisk(signal, profile) {
     let losingMatchDetails = [];
 
     for (const fp of signalFPs) {
-        // Buscar en combos perdedores
         const losingMatch = profile.losingCombos.find(c => c.fingerprint === fp);
         if (losingMatch) {
             losingMatchCount++;
@@ -470,9 +470,7 @@ function evaluateHiddenRisk(signal, profile) {
         }
     }
 
-    // Penalización escalonada por cantidad de combos perdedores que coinciden
     if (losingMatchCount >= 5) {
-        // Señal coincide con muchos patrones perdedores → riesgo muy alto
         const comboPenalty = Math.min(35, 15 + (losingMatchCount * 3));
         riskScore += comboPenalty;
         factors.push(`${losingMatchCount} combos perdedores (peor: ${worstLosingWR}%) (+${comboPenalty})`);
@@ -498,8 +496,7 @@ function evaluateHiddenRisk(signal, profile) {
         factors.push(`${winningMatchCount} combos ganadores (-${bonus})`);
     }
 
-    // ── 4. Contexto actual (LOB, Momentum, Stability) ──
-    // Momentum contra dirección = riesgo adicional
+    // ── 4. Contexto actual ──
     const isB = signal.analysis.direction === 'BUY';
     if (signal.momentumSlope !== undefined) {
         if ((isB && signal.momentumSlope < -0.0005) || (!isB && signal.momentumSlope > 0.0005)) {
@@ -508,19 +505,16 @@ function evaluateHiddenRisk(signal, profile) {
         }
     }
 
-    // LOB desalineado
     if ((isB && signal.obi < -0.1) || (!isB && signal.obi > 0.1)) {
         riskScore += 6;
         factors.push(`LOB desalineado (+6)`);
     }
 
-    // Stability muy baja combinada con edge alto = sobreconfianza peligrosa
     if (signal.analysis.stability < 0.50 && signal.analysis.cwev >= 8) {
         riskScore += 10;
         factors.push(`Baja estabilidad + CWEV alto (+10)`);
     }
 
-    // Clamping final
     riskScore = Math.max(0, Math.min(100, riskScore));
 
     return { riskScore, riskFactors: factors };
@@ -599,7 +593,8 @@ function applyAdaptiveFilter(signal) {
     // ── CAPA 3: Memoria de patrones fallidos recientes ──
     const cwevRound = Math.round(signal.analysis.cwev || 0);
     const patternKey = `${signal.tf}_${signal.analysis.direction}_${cwevRound}`;
-    if (RECENT_FAILURE_PATTERNS.includes(patternKey)) {
+    // IMPROVEMENT: .has() en Set = O(1) vs .includes() en Array = O(n)
+    if (RECENT_FAILURE_PATTERNS.has(patternKey)) {
         penalty += 30;
         reasons.push(`Patrón fallido reciente: ${patternKey} (+30)`);
     }
@@ -632,7 +627,6 @@ function getAssetLearningContext(assetId) {
         ctx += `- LOB alineado mejora WR en +${profile.lobBias.toFixed(1)}%\n`;
     }
 
-    // Información de rachas
     if (profile.currentLossStreak >= 2) {
         ctx += `- ⚠️ RACHA ACTIVA: ${profile.currentLossStreak} pérdidas consecutivas\n`;
     }
@@ -640,13 +634,11 @@ function getAssetLearningContext(assetId) {
         ctx += `- Racha máxima histórica: ${profile.maxLossStreak} pérdidas\n`;
     }
 
-    // Top combos perdedores
     if (profile.losingCombos.length > 0) {
         const topLosing = profile.losingCombos.slice(0, 3);
         ctx += `- Combos tóxicos: ${topLosing.map(c => `${c.fingerprint}(${c.wr}% WR, ${c.n}t)`).join(', ')}\n`;
     }
 
-    // Top combos ganadores
     if (profile.winningCombos.length > 0) {
         const topWinning = profile.winningCombos.slice(0, 3);
         ctx += `- Combos rentables: ${topWinning.map(c => `${c.fingerprint}(${c.wr}% WR, ${c.n}t)`).join(', ')}\n`;
@@ -667,7 +659,8 @@ async function syncTimeWithBinance() {
         timeOffset = res.data.serverTime - Date.now();
         console.log(`[SYS] Reloj sincronizado. Offset: ${timeOffset}ms`);
     } catch(e) {
-        console.error("[SYS] Error al sincronizar reloj.");
+        // FIX: Error detallado en vez de mensaje genérico
+        console.error('[TIME_SYNC]', { message: e.message, time: new Date().toISOString() });
     }
 }
 syncTimeWithBinance();
@@ -681,22 +674,32 @@ function getLocalTime() {
 
 
 // ═══════════════════════════════════════════════════════════════════
-// MÓDULO 3: LOGGING CSV
+// MÓDULO 3: LOGGING CSV (ASYNC — NO BLOQUEA EVENT LOOP)
 // ═══════════════════════════════════════════════════════════════════
 
-function logToCSV(data) {
+// FIX: logToCSV ahora es async y usa fsPromises — nunca bloquea el event loop
+async function logToCSV(data) {
     const filePath = './auditoria_sniper.csv';
     const now = new Date(getSyncedTime());
     const fecha = now.toLocaleDateString('es-AR');
     const hora = now.toLocaleTimeString('es-AR', { hour12: false });
 
-    if (!fs.existsSync(filePath)) {
-        const header = 'Fecha,Hora,Activo,TF,Dir,Prob,LOB,Edge,Alpha,Stability,CWEV,Samples,Veredicto,Open,Close,IA_Verdict,IA_Score,IA_Context,Mode\n';
-        fs.writeFileSync(filePath, header);
-    }
+    try {
+        try {
+            await fsPromises.access(filePath);
+        } catch {
+            // FIX: Crear header con fsPromises.writeFile en vez de fs.writeFileSync
+            const header = 'Fecha,Hora,Activo,TF,Dir,Prob,LOB,Edge,Alpha,Stability,CWEV,Samples,Veredicto,Open,Close,IA_Verdict,IA_Score,IA_Context,Mode\n';
+            await fsPromises.writeFile(filePath, header);
+        }
 
-    const row = `${fecha},${hora},${data.asset || ''},${data.tf || ''},${data.dir || ''},${data.prob || ''},${data.lob || ''},${data.edge || ''},${data.alpha || ''},${data.stab || ''},${data.cwev || ''},${data.samples || ''},${data.veredicto || ''},${data.open || ''},${data.close || ''},${data.iaVerdict || ''},${data.iaScore || ''},${data.iaContext || ''},${data.mode || ''}\n`;
-    fs.appendFileSync(filePath, row);
+        const row = `${fecha},${hora},${data.asset || ''},${data.tf || ''},${data.dir || ''},${data.prob || ''},${data.lob || ''},${data.edge || ''},${data.alpha || ''},${data.stab || ''},${data.cwev || ''},${data.samples || ''},${data.veredicto || ''},${data.open || ''},${data.close || ''},${data.iaVerdict || ''},${data.iaScore || ''},${data.iaContext || ''},${data.mode || ''}\n`;
+        // FIX: appendFile async en vez de appendFileSync
+        await fsPromises.appendFile(filePath, row);
+    } catch (e) {
+        // SAFETY: Loggear fallo de escritura sin romper el bot
+        console.error('[CSV_WRITE]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
+    }
 }
 
 
@@ -1066,16 +1069,28 @@ REASONING: (2 oraciones).`;
             contents: [{ parts: [{ text: promptText }] }],
             generationConfig: { temperature: 0.2 }
         });
-        const text = result.data.candidates[0].content.parts[0].text;
 
+        // SAFETY: Validación robusta de la respuesta de Gemini
+        const candidates = result?.data?.candidates;
+        if (!candidates || !candidates[0]?.content?.parts?.[0]?.text) {
+            console.error('[IA_PARSE]', { message: 'Respuesta vacía o malformada de Gemini', time: new Date().toISOString() });
+            return null;
+        }
+        const text = candidates[0].content.parts[0].text;
+
+        // SAFETY: Parsing con fallbacks seguros
         const scoreMatch = text.match(/AI_SCORE:\s*(\d+)/i);
-        const iaScore = scoreMatch ? parseInt(scoreMatch[1]) : 0;
+        const iaScore = scoreMatch ? Math.min(100, Math.max(0, parseInt(scoreMatch[1]))) : 0;
 
         const contextMatch = text.match(/TRADE_CONTEXT:\s*(CONTINUATION|REVERSAL|TRAP)/i);
         const iaContextText = contextMatch ? contextMatch[1].toUpperCase() : 'UNKNOWN';
 
         const reasonMatch = text.match(/REASONING:\s*([\s\S]*?)$/i);
-        const iaReasoning = reasonMatch ? reasonMatch[1].trim().replace(/[*_[\]]/g, '') : 'Análisis completado.';
+        const iaReasoning = reasonMatch ? reasonMatch[1].trim().replace(/[*_[\]]/g, '').substring(0, 500) : 'Análisis completado.';
+
+        if (!scoreMatch) {
+            console.error('[IA_PARSE]', { message: 'No se pudo extraer AI_SCORE', rawText: text.substring(0, 200), time: new Date().toISOString() });
+        }
 
         return {
             iaScore,
@@ -1085,7 +1100,8 @@ REASONING: (2 oraciones).`;
             isExecute: iaScore >= 65
         };
     } catch (e) {
-        console.error(`[IA] Error Gemini: ${e.message}`);
+        // FIX: Error detallado con stack
+        console.error('[IA_GEMINI]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
         return null;
     }
 }
@@ -1111,7 +1127,10 @@ bot.on('callback_query', async (query) => {
             message_id: signalData._messageId,
             parse_mode: 'Markdown'
         });
-    } catch(e) {}
+    } catch(e) {
+        // FIX: Error silencioso → loggear
+        console.error('[TG_EDIT_LOADING]', { message: e.message, time: new Date().toISOString() });
+    }
 
     const iaResult = await executeIAAnalysis(sigId);
 
@@ -1122,7 +1141,10 @@ bot.on('callback_query', async (query) => {
                 message_id: signalData._messageId,
                 parse_mode: 'Markdown'
             });
-        } catch(e) {}
+        } catch(e) {
+            // FIX: Error silencioso → loggear
+            console.error('[TG_EDIT_FAIL]', { message: e.message, time: new Date().toISOString() });
+        }
         return;
     }
 
@@ -1152,11 +1174,11 @@ bot.on('callback_query', async (query) => {
             parse_mode: 'Markdown'
         });
     } catch(e) {
-        console.error('[IA] Error editando mensaje:', e.message);
+        console.error('[TG_EDIT_IA]', { message: e.message, time: new Date().toISOString() });
     }
 
-    // Log IA
-    logToCSV({
+    // FIX: logToCSV ahora es async, usar await
+    await logToCSV({
         asset: signalData.assetId, tf: signalData.tf, dir: signalData.analysis.direction,
         prob: signalData.analysis.prob.toFixed(1), lob: signalData.obi.toFixed(3),
         edge: signalData.analysis.edge.toFixed(2), alpha: signalData.analysis.acs.toFixed(3),
@@ -1186,7 +1208,7 @@ bot.onText(/\/scan/, async (msg) => {
 
 bot.onText(/\/profile/, async (msg) => {
     if (msg.chat.id.toString() === chatId) {
-        const resolvedRows = parseCSVResolved();
+        const resolvedRows = await parseCSVResolved();
         const profiles = buildAdaptiveProfiles(resolvedRows);
 
         let text = '📊 *PERFILES ADAPTATIVOS*\n';
@@ -1216,7 +1238,7 @@ bot.onText(/\/profile/, async (msg) => {
 
 bot.onText(/\/stats/, async (msg) => {
     if (msg.chat.id.toString() === chatId) {
-        const resolved = parseCSVResolved();
+        const resolved = await parseCSVResolved();
         if (resolved.length === 0) {
             bot.sendMessage(chatId, '📊 Sin trades resueltos aún.');
             return;
@@ -1242,8 +1264,8 @@ bot.onText(/\/stats/, async (msg) => {
     }
 });
 
-console.log(`🤖 Quant Sniper V13 ADAPTIVE iniciando...`);
-bot.sendMessage(chatId, '🟢 *Quant Sniper V13 ADAPTIVE* encendido.\n🧠 Aprendizaje + IA on-demand\n📊 /profile /stats /scan', { parse_mode: 'Markdown' });
+console.log(`🤖 Quant Sniper V13 ADAPTIVE PROD iniciando...`);
+bot.sendMessage(chatId, '🟢 *Quant Sniper V13 ADAPTIVE PROD* encendido.\n🧠 Aprendizaje + IA on-demand\n📊 /profile /stats /scan', { parse_mode: 'Markdown' });
 
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1265,20 +1287,30 @@ async function globalScan(scanType = 'auto') {
     try {
         const title = scanType === 'auto' ? '🔄 *Scan Auto*' : '⏳ *Scan Manual*';
         statusMsg = await bot.sendMessage(chatId, `${title} ▶️ ${startTime}`, { parse_mode: 'Markdown' });
-    } catch(e) {}
+    } catch(e) {
+        // FIX: Error silencioso → loggear
+        console.error('[TG_SCAN_MSG]', { message: e.message, time: new Date().toISOString() });
+    }
 
-    // --- Cargar CSV y construir perfiles ---
+    // --- Cargar CSV y construir perfiles (ASYNC) ---
     let parsedData = [];
     const assetPerformance = {};
     const candlesByAsset = {};
 
     try {
-        if (fs.existsSync('./auditoria_sniper.csv')) {
-            const content = fs.readFileSync('./auditoria_sniper.csv', 'utf8');
+        // FIX: Lectura async del CSV — no bloquea event loop
+        const filePath = './auditoria_sniper.csv';
+        let fileExists = false;
+        try { await fsPromises.access(filePath); fileExists = true; } catch {}
+
+        if (fileExists) {
+            const content = await fsPromises.readFile(filePath, 'utf8');
             const lines = content.split('\n').filter(l => l.trim() !== '');
             if (lines.length > 1) {
                 const headers = lines[0].split(',');
-                for (let i = 1; i < lines.length; i++) {
+                // IMPROVEMENT: Solo procesar últimas MAX_CSV_ROWS filas
+                const startLine = Math.max(1, lines.length - MAX_CSV_ROWS);
+                for (let i = startLine; i < lines.length; i++) {
                     const vals = lines[i].split(',');
                     let obj = {};
                     headers.forEach((h, idx) => obj[h.trim()] = vals[idx]);
@@ -1312,11 +1344,14 @@ async function globalScan(scanType = 'auto') {
                 }
             }
         }
-    } catch (e) {}
+    } catch (e) {
+        // FIX: Error silencioso → loggear
+        console.error('[SCAN_CSV_LOAD]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
+    }
 
-    // Construir zonas y perfiles adaptativos
+    // Construir zonas y perfiles adaptativos (parseCSVResolved ahora es async)
     CURRENT_WINNING_ZONES = buildWinningZonesFromCSV(parsedData);
-    const resolvedRows = parseCSVResolved();
+    const resolvedRows = await parseCSVResolved();
     ADAPTIVE_PROFILES = buildAdaptiveProfiles(resolvedRows);
     updateMemoryFromCSV(resolvedRows);
 
@@ -1414,13 +1449,19 @@ async function globalScan(scanType = 'auto') {
                     });
                     if (bV + aV > 0) obi = (bV - aV) / (bV + aV);
                 }
-            } catch(e) {}
+            } catch(e) {
+                // FIX: Error silencioso en LOB → loggear
+                console.error('[LOB_FETCH]', { asset: asset.id, message: e.message, time: new Date().toISOString() });
+            }
 
             for (const item of tfs) {
                 const res = runAnalysisElite(item.aggregate > 1 ? aggregateCandles(historical, item.aggregate) : historical);
                 if (res) validSignals.push({ assetId: asset.id, symbolBinance: asset.symbolBinance, tf: item.tf, analysis: res, obi, macro: { h1: s1h, h4: s4h } });
             }
-        } catch(e) { console.error(`Error escaneando ${asset.id}:`, e.message); }
+        } catch(e) {
+            // FIX: Error detallado por activo
+            console.error('[SCAN_ASSET]', { asset: asset.id, message: e.message, stack: e.stack, time: new Date().toISOString() });
+        }
     }
 
     // --- Filtrado de consenso + Filtro Adaptativo ---
@@ -1523,7 +1564,7 @@ async function globalScan(scanType = 'auto') {
         if (statusMsg) {
             bot.editMessageText(`✅ *Scan completado* ${endTime} | ${consensusSignals.length} señales`, {
                 chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown'
-            }).catch(()=>{});
+            }).catch((e) => { console.error('[TG_EDIT_SCAN]', { message: e.message, time: new Date().toISOString() }); });
         }
 
         for (const s of consensusSignals) {
@@ -1602,8 +1643,8 @@ async function globalScan(scanType = 'auto') {
             s._messageId = sentMsg.message_id;
             SIGNAL_CACHE.set(sigId, s);
 
-            // Log CSV
-            logToCSV({
+            // FIX: logToCSV ahora es async
+            await logToCSV({
                 asset: s.assetId, tf: s.tf, dir: s.analysis.direction,
                 prob: s.analysis.prob.toFixed(1), lob: s.obi.toFixed(3),
                 edge: s.analysis.edge.toFixed(2), alpha: s.analysis.acs.toFixed(3),
@@ -1629,7 +1670,7 @@ async function globalScan(scanType = 'auto') {
     } else if (statusMsg) {
         bot.editMessageText(`💤 *Scan finalizado* ${endTime} — Sin señales`, {
             chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown'
-        }).catch(()=>{});
+        }).catch((e) => { console.error('[TG_EDIT_NOSIG]', { message: e.message, time: new Date().toISOString() }); });
     }
 }
 
@@ -1643,7 +1684,9 @@ setInterval(() => {
     const now = new Date(getSyncedTime());
     const m = now.getMinutes();
     const s = now.getSeconds();
-    if ((m % 5 === 3) && s === 15 && lastScanMinute !== m) {
+    // IMPROVEMENT: Ventana de 5 segundos (14-18) en vez de segundo exacto (15)
+    // Protección: lastScanMinute evita disparos dobles
+    if ((m % 5 === 3) && s >= 14 && s <= 18 && lastScanMinute !== m) {
         lastScanMinute = m;
         globalScan('auto');
     }
@@ -1677,7 +1720,8 @@ setInterval(async () => {
                 const auditMsg = `${resultEmoji} *${audit.assetId}* ${audit.direction} → *${iconResult}*\nOpen: ${openPrice.toFixed(4)} | Close: ${closePrice.toFixed(4)}`;
                 await bot.sendMessage(chatId, auditMsg, { parse_mode: 'Markdown', reply_to_message_id: audit.messageId });
 
-                logToCSV({
+                // FIX: logToCSV ahora es async
+                await logToCSV({
                     asset: audit.assetId, tf: audit.tf, dir: audit.direction,
                     prob: audit.logData.prob, lob: audit.logData.lob, edge: audit.logData.edge,
                     alpha: audit.logData.alpha, stab: audit.logData.stab, cwev: audit.logData.cwev,
@@ -1689,13 +1733,16 @@ setInterval(async () => {
                 // ── Actualización en tiempo real de memoria dinámica ──
                 if (iconResult === 'PERDIDA') {
                     LOSS_STREAKS[audit.assetId] = (LOSS_STREAKS[audit.assetId] || 0) + 1;
-                    // Agregar patrón fallido
                     const cwevRound = Math.round(parseFloat(audit.logData.cwev) || 0);
                     const failKey = `${audit.tf}_${audit.direction}_${cwevRound}`;
-                    if (!RECENT_FAILURE_PATTERNS.includes(failKey)) {
-                        RECENT_FAILURE_PATTERNS.push(failKey);
-                        while (RECENT_FAILURE_PATTERNS.length > 50) {
-                            RECENT_FAILURE_PATTERNS.shift();
+                    // IMPROVEMENT: Set .add() en vez de Array .push()
+                    RECENT_FAILURE_PATTERNS.add(failKey);
+                    // IMPROVEMENT: FIFO con Set
+                    if (RECENT_FAILURE_PATTERNS.size > 50) {
+                        const arr = [...RECENT_FAILURE_PATTERNS];
+                        RECENT_FAILURE_PATTERNS.clear();
+                        for (const item of arr.slice(-50)) {
+                            RECENT_FAILURE_PATTERNS.add(item);
                         }
                     }
                 } else if (iconResult === 'GANADA') {
@@ -1703,7 +1750,11 @@ setInterval(async () => {
                 }
 
                 PENDING_AUDITS.splice(i, 1);
-            } catch (error) { audit.retries++; }
+            } catch (error) {
+                // FIX: Error silencioso en auditoría → loggear
+                console.error('[AUDIT]', { asset: audit.assetId, message: error.message, retries: audit.retries, time: new Date().toISOString() });
+                audit.retries++;
+            }
         }
     }
 }, 15000);
