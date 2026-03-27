@@ -1162,14 +1162,14 @@ async function globalScan(scanType = 'auto') {
     const startTime = getLocalTime();
     console.log(`[${startTime}] 🚀 Scan ADAPTIVE...`);
 
-    let statusMsg;
-    try {
-        const title = scanType === 'auto' ? '🔄 *Scan Auto*' : '⏳ *Scan Manual*';
-        statusMsg = await bot.sendMessage(chatId, `${title} ▶️ ${startTime}`, { parse_mode: 'Markdown' });
-    } catch(e) {
-        // FIX: Error silencioso → loggear
-        console.error('[TG_SCAN_MSG]', { message: e.message, time: new Date().toISOString() });
-    }
+    // SILENCED: No enviar mensaje de inicio de scan durante recolección
+    // let statusMsg;
+    // try {
+    //     const title = scanType === 'auto' ? '🔄 *Scan Auto*' : '⏳ *Scan Manual*';
+    //     statusMsg = await bot.sendMessage(chatId, `${title} ▶️ ${startTime}`, { parse_mode: 'Markdown' });
+    // } catch(e) {
+    //     console.error('[TG_SCAN_MSG]', { message: e.message, time: new Date().toISOString() });
+    // }
 
     // --- Cargar datos desde Supabase con caché en RAM ---
     let parsedData = [];
@@ -1428,8 +1428,8 @@ async function globalScan(scanType = 'auto') {
         if (!isB && momentumSlope > 0) isElite = false;
         if (isB && nearResistance) isElite = false;
         if (!isB && nearSupport) isElite = false;
-        // INTEGRATION 6.2: Usar threshold dinámico del motor adaptativo
-        const currentThreshold = adaptive.getDynamicThreshold();
+        // FORCED: Threshold congelado en 54 durante fase de recolección de datos
+        const currentThreshold = PROB_THRESHOLD; // Era: adaptive.getDynamicThreshold()
         if (s.analysis.prob < currentThreshold) isElite = false;
         if (s.analysis.acs < 0.015) isElite = false;
         if (s.analysis.stability < 0.40) isElite = false;
@@ -1479,11 +1479,12 @@ async function globalScan(scanType = 'auto') {
     const endTime = getLocalTime();
 
     if (consensusSignals.length > 0) {
-        if (statusMsg) {
-            bot.editMessageText(`✅ *Scan completado* ${endTime} | ${consensusSignals.length} señales`, {
-                chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown'
-            }).catch((e) => { console.error('[TG_EDIT_SCAN]', { message: e.message, time: new Date().toISOString() }); });
-        }
+        // SILENCED: No editar mensaje de status durante recolección
+        // if (statusMsg) {
+        //     bot.editMessageText(`✅ *Scan completado* ${endTime} | ${consensusSignals.length} señales`, {
+        //         chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown'
+        //     }).catch((e) => { console.error('[TG_EDIT_SCAN]', { message: e.message, time: new Date().toISOString() }); });
+        // }
 
         for (const s of consensusSignals) {
             const sigId = `sig_${signalCounter++}`;
@@ -1604,11 +1605,13 @@ async function globalScan(scanType = 'auto') {
                 }
             });
         }
-    } else if (statusMsg) {
-        bot.editMessageText(`💤 *Scan finalizado* ${endTime} — Sin señales`, {
-            chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown'
-        }).catch((e) => { console.error('[TG_EDIT_NOSIG]', { message: e.message, time: new Date().toISOString() }); });
     }
+    // SILENCED: No enviar mensaje de "sin señales" durante recolección
+    // else if (statusMsg) {
+    //     bot.editMessageText(`💤 *Scan finalizado* ${endTime} — Sin señales`, {
+    //         chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown'
+    //     }).catch((e) => { console.error('[TG_EDIT_NOSIG]', { message: e.message, time: new Date().toISOString() }); });
+    // }
 
     } finally {
         // LOCK: Liberar scan
@@ -1717,7 +1720,7 @@ setInterval(() => {
 
 // DB: Rotación automática — mantener solo últimos 1000 trades (cada 6 horas)
 setInterval(() => {
-    db.cleanupOldTrades(1000);
+    db.cleanupOldTrades(2000);
 }, 6 * 60 * 60 * 1000);
 
 // Comando /analyze — Análisis adaptativo on-demand
