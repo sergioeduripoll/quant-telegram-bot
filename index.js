@@ -1566,8 +1566,15 @@ async function globalScan(scanType = 'auto') {
 
             s._createdAt = Date.now();
 
-            // Enviar mensaje SIN botón
-            const sentMsg = await bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' });
+            // Enviar mensaje — fallback sin Markdown si falla el parseo
+            let sentMsg;
+            try {
+                sentMsg = await bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' });
+            } catch (tgErr) {
+                // Fallback: enviar sin formato si Markdown falla
+                console.error('[TG_MARKDOWN]', { message: tgErr.message, time: new Date().toISOString() });
+                sentMsg = await bot.sendMessage(chatId, msgText.replace(/[*_`]/g, ''));
+            }
 
             s._messageText = msgText;
             s._messageId = sentMsg.message_id;
