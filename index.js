@@ -1238,13 +1238,15 @@ async function globalScan(scanType = 'auto') {
     adaptive.learnFromCSV(resolvedRows);
 
     // Selección dinámica de activos
+    // DISABLED: Usar todos los 7 mercados durante fase de recolección.
+    // Descomentar el bloque para producción (filtra top 3 por WR).
     let allowedAssets = CONFIG.MARKETS.map(m => m.id);
-    const assetsWithData = Object.keys(assetPerformance);
-    if (assetsWithData.length >= 3) {
-        allowedAssets = assetsWithData
-            .sort((a, b) => parseFloat(assetPerformance[b].wr) - parseFloat(assetPerformance[a].wr))
-            .slice(0, 3);
-    }
+    // const assetsWithData = Object.keys(assetPerformance);
+    // if (assetsWithData.length >= 3) {
+    //     allowedAssets = assetsWithData
+    //         .sort((a, b) => parseFloat(assetPerformance[b].wr) - parseFloat(assetPerformance[a].wr))
+    //         .slice(0, 3);
+    // }
 
     const validSignals = [];
     let tfs = [{ tf: '5M', aggregate: 1 }];
