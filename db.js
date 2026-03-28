@@ -182,7 +182,8 @@ async function runAdaptiveAnalysis(adaptive) {
         return { trades: 0, message: 'Sin trades resueltos en DB' };
     }
 
-    adaptive.learnFromCSV(resolved, 'bootstrap');
+    // FIX: incremental en vez de bootstrap — evita timeout con muchos trades
+    adaptive.learnFromCSV(resolved, 'incremental');
 
     const threshold = adaptive.getDynamicThreshold();
     const stats = adaptive.ASSET_STATS;
