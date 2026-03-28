@@ -1458,13 +1458,12 @@ async function globalScan(scanType = 'auto') {
             s.riskScore = adaptiveResult.riskScore;
             s.riskFactors = adaptiveResult.riskFactors;
 
+            // DISABLED: Filtro desactivado durante fase de recolección.
+            // Solo loggea pero NO bloquea. Descomentar el continue para producción.
             if (!adaptiveResult.pass) {
                 const riskDetail = adaptiveResult.riskScore > 0 ? ` | RiskScore: ${adaptiveResult.riskScore}/100` : '';
-                console.log(`[FILTRO] ${s.assetId} ${s.tf} bloqueada: ${adaptiveResult.reason}${riskDetail}`);
-                if (adaptiveResult.riskFactors.length > 0) {
-                    console.log(`  → Factores: ${adaptiveResult.riskFactors.join(', ')}`);
-                }
-                continue;
+                console.log(`[FILTRO-LOG] ${s.assetId} ${s.tf} (pasaría bloqueada en prod): ${adaptiveResult.reason}${riskDetail}`);
+                // continue;  // REACTIVAR EN PRODUCCIÓN
             }
 
             s.isElite = isElite;
@@ -1516,9 +1515,10 @@ async function globalScan(scanType = 'auto') {
             );
 
             // Si el motor adaptativo bloquea este activo, saltear
+            // DISABLED: Bloqueo desactivado durante fase de recolección.
             if (adaptiveResult.blocked) {
-                console.log(`[ADAPTIVE] ${s.assetId} bloqueado: ${adaptiveResult.blockReason || 'ranking dinámico'} (hiddenRisk: ${adaptiveResult.hiddenRisk || 0})`);
-                continue;
+                console.log(`[ADAPTIVE-LOG] ${s.assetId} (pasaría bloqueada en prod): ${adaptiveResult.blockReason || 'ranking dinámico'} (hiddenRisk: ${adaptiveResult.hiddenRisk || 0})`);
+                // continue;  // REACTIVAR EN PRODUCCIÓN
             }
 
             // Preparar datos para IA antes de enviar mensaje
