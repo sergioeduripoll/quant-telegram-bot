@@ -137,13 +137,16 @@ function thresholdRecordResult(isWin) {
     totalTradesForThreshold++;
     if (isWin) totalWinsForThreshold++;
 
-    if (totalTradesForThreshold % 20 === 0 && totalTradesForThreshold > 0) {
-        const wr = totalWinsForThreshold / totalTradesForThreshold;
-        if (wr < 0.55) dynamicThreshold += 1;
-        if (wr > 0.65) dynamicThreshold -= 1;
-        dynamicThreshold = clamp(dynamicThreshold, 50, 65);
-        console.log(`[ADAPTIVE] Threshold ajustado a ${dynamicThreshold} (WR: ${(wr * 100).toFixed(1)}% sobre ${totalTradesForThreshold} trades)`);
-    }
+    // FROZEN: Threshold congelado en 54 durante fase de recolección de datos.
+    // Descomentar el bloque de abajo cuando se reactive el modo producción.
+    //
+    // if (totalTradesForThreshold % 20 === 0 && totalTradesForThreshold > 0) {
+    //     const wr = totalWinsForThreshold / totalTradesForThreshold;
+    //     if (wr < 0.55) dynamicThreshold += 1;
+    //     if (wr > 0.65) dynamicThreshold -= 1;
+    //     dynamicThreshold = clamp(dynamicThreshold, 50, 65);
+    //     console.log(`[ADAPTIVE] Threshold ajustado a ${dynamicThreshold} (WR: ${(wr * 100).toFixed(1)}% sobre ${totalTradesForThreshold} trades)`);
+    // }
 }
 
 // FIX #9: Preparación para per-asset threshold (función extraída)
@@ -360,7 +363,7 @@ function computeAdaptiveAdjustment(asset, tf, direction, cwev, candles) {
     const hiddenRisk = clamp(negRL + negAsset + negContext, 0, 50);
 
     // Bloqueo compuesto: shouldFilterAsset O hiddenRisk alto
-    const finalBlocked = blocked || hiddenRisk > 45;
+    const finalBlocked = blocked || hiddenRisk > 30;
 
     return {
         totalAdjustment: clamp(totalAdjustment, -30, 30),
