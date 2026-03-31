@@ -958,6 +958,18 @@ function makeProgressBar(percent) {
     return '█'.repeat(f) + '░'.repeat(10 - f);
 }
 
+/**
+ * Envío seguro a Telegram: intenta Markdown, fallback sin formato.
+ */
+async function safeSend(text) {
+    try {
+        return await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+    } catch (e) {
+        console.error('[TG_MARKDOWN]', { message: e.message, time: new Date().toISOString() });
+        return await bot.sendMessage(chatId, text.replace(/[*_`|]/g, ''));
+    }
+}
+
 
 // ═══════════════════════════════════════════════════════════════════
 // MÓDULO 7: IA AUTOMÁTICA (Gemini — se ejecuta al generar señal)
@@ -1079,7 +1091,7 @@ bot.onText(/\/profile/, async (msg) => {
             text += '\n';
         }
 
-        bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+        await safeSend(text);
     }
 });
 
@@ -1531,6 +1543,38 @@ async function globalScan(scanType = 'auto') {
             // IA AUTOMÁTICA: ejecutar Gemini para esta señal
             const iaResult = await executeIAAnalysis(s, modeString);
 
+            // ═══════════════════════════════════════════════════════
+            // V16: FILTROS ESTADÍSTICOS (basados en 637 trades reales)
+            // ═══════════════════════════════════════════════════════
+
+            // A. BLOQUEADOR TRAMPA IA: ia_score>70 + cwev<3 = 30% WR (23 trades)
+            //    ia_score>75 + cwev<4 = 11% WR (9 trades) — casi pérdida garantizada
+            if (iaResult && iaResult.iaScore > 70 && s.analysis.cwev < 3.0) {
+                console.log(`[V16-TRAP] ${s.assetId} ${s.tf} BLOQUEADA: Trampa IA (score=${iaResult.iaScore}, cwev=${s.analysis.cwev.toFixed(1)}) — WR histórico <30%`);
+                continue;
+            }
+
+            // B. INVERSOR CONTRARIAN: combos con WR < 40% sobre 20+ trades
+            //    XRP/USD BUY: 38.5% → invertido 61.5% (52t)
+            //    XRP/USD SELL: 38.1% → invertido 61.9% (42t)
+            //    SOL/USD BUY: 36.4% → invertido 63.6% (22t)
+            const KAMIKAZE_COMBOS = [
+                { asset: 'XRP/USD', dir: 'BUY',  originalWR: 38.5, invertedWR: 61.5, n: 52 },
+                { asset: 'XRP/USD', dir: 'SELL', originalWR: 38.1, invertedWR: 61.9, n: 42 },
+                { asset: 'SOL/USD', dir: 'BUY',  originalWR: 36.4, invertedWR: 63.6, n: 22 }
+            ];
+
+            const kamikaze = KAMIKAZE_COMBOS.find(k => k.asset === s.assetId && k.dir === s.analysis.direction);
+            if (kamikaze) {
+                const oldDir = s.analysis.direction;
+                s.analysis.direction = oldDir === 'BUY' ? 'SELL' : 'BUY';
+                s.analysis.edge *= -1;
+                s.isInverted = true;
+                console.log(`[V16-INVERT] ${s.assetId} ${s.tf} invertida: ${oldDir}→${s.analysis.direction} (WR original: ${kamikaze.originalWR}%, invertido: ${kamikaze.invertedWR}%)`);
+            }
+
+            // ═══════════════════════════════════════════════════════
+
             // Trade levels: usar contexto IA si disponible, sino default
             const iaContext = (iaResult && iaResult.isExecute && iaResult.iaContext !== 'TRAP') ? iaResult.iaContext : 'CONTINUATION';
             const tradeData = calculateTradeLevels(
@@ -1543,10 +1587,12 @@ async function globalScan(scanType = 'auto') {
             );
 
             // --- MENSAJE COMPLETO (señal + IA + trading en un solo envío) ---
-            let msgText = `🎯 *${s.assetId} | ${s.tf}*\n\n`;
+            const invertTag = s.isInverted ? '🔄 *INVERTIDA POR ESTADÍSTICA*\n\n' : '';
+            const dirIcon = s.analysis.direction === 'BUY' ? '🟢' : '🔴';
+            let msgText = `${invertTag}🎯 *${s.assetId} | ${s.tf}*\n\n`;
             msgText += `MODO: E:${eliteCheck} → A:${agrCheck}\n`;
             msgText += `🏆 ${scoreVisual}\n\n`;
-            msgText += `${icon} *${s.analysis.direction}*\n`;
+            msgText += `${dirIcon} *${s.analysis.direction}*\n`;
 
             // Bloque IA
             if (iaResult) {
@@ -1575,7 +1621,7 @@ async function globalScan(scanType = 'auto') {
             } catch (tgErr) {
                 // Fallback: enviar sin formato si Markdown falla
                 console.error('[TG_MARKDOWN]', { message: tgErr.message, time: new Date().toISOString() });
-                sentMsg = await bot.sendMessage(chatId, msgText.replace(/[*_`]/g, ''));
+                sentMsg = await bot.sendMessage(chatId, msgText.replace(/[*_`|]/g, ''));
             }
 
             s._messageText = msgText;
@@ -1735,32 +1781,38 @@ setInterval(() => {
 // Comando /analyze — Análisis adaptativo on-demand
 bot.onText(/\/analyze/, async (msg) => {
     if (msg.chat.id.toString() === chatId) {
-        const waitMsg = await bot.sendMessage(chatId, '🧠 _Ejecutando análisis adaptativo..._', { parse_mode: 'Markdown' });
-        const summary = await db.runAdaptiveAnalysis(adaptive);
+        await safeSend('🧠 Ejecutando análisis adaptativo...');
 
-        if (summary.trades === 0) {
-            bot.editMessageText('📊 Sin trades resueltos en DB.', { chat_id: chatId, message_id: waitMsg.message_id });
-            return;
-        }
+        try {
+            const summary = await db.runAdaptiveAnalysis(adaptive);
 
-        let text = `🧠 *ANÁLISIS ADAPTATIVO*\n\n`;
-        text += `📊 Trades analizados: ${summary.trades}\n`;
-        text += `🎯 Threshold dinámico: ${summary.threshold}\n\n`;
-
-        if (summary.topAssets.length > 0) {
-            text += `🏆 *Top Assets:*\n`;
-            for (const a of summary.topAssets) {
-                text += `  ${a.asset}: ${a.wr}% WR (${a.trades}t)\n`;
+            if (summary.trades === 0) {
+                await safeSend('📊 Sin trades resueltos en DB.');
+                return;
             }
-        }
 
-        if (summary.topPatterns.length > 0) {
-            text += `\n🧬 *Top Patrones RL:*\n`;
-            for (const p of summary.topPatterns) {
-                text += `  ${p.pattern}: score ${p.score} (${p.trades}t)\n`;
+            let text = '🧠 ANÁLISIS ADAPTATIVO\n\n';
+            text += `Trades analizados: ${summary.trades}\n`;
+            text += `Threshold: ${summary.threshold}\n\n`;
+
+            if (summary.topAssets.length > 0) {
+                text += 'Top Assets:\n';
+                for (const a of summary.topAssets) {
+                    text += `  ${a.asset}: ${a.wr}% WR (${a.trades}t)\n`;
+                }
             }
-        }
 
-        bot.editMessageText(text, { chat_id: chatId, message_id: waitMsg.message_id, parse_mode: 'Markdown' });
+            if (summary.topPatterns.length > 0) {
+                text += '\nTop Patrones RL:\n';
+                for (const p of summary.topPatterns) {
+                    text += `  ${p.pattern}: score ${p.score} (${p.trades}t)\n`;
+                }
+            }
+
+            await safeSend(text);
+        } catch (e) {
+            console.error('[ANALYZE]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
+            await safeSend('❌ Error en análisis. Ver logs.');
+        }
     }
 });
