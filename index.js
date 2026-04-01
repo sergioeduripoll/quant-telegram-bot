@@ -1249,16 +1249,15 @@ async function globalScan(scanType = 'auto') {
     // INTEGRATION 6.5: Aprendizaje adaptativo evolutivo
     adaptive.learnFromCSV(resolvedRows);
 
-    // Selección dinámica de activos
-    // DISABLED: Usar todos los 7 mercados durante fase de recolección.
-    // Descomentar el bloque para producción (filtra top 3 por WR).
+    // PRODUCCIÓN: Selección dinámica — solo Top 3 activos por WR
     let allowedAssets = CONFIG.MARKETS.map(m => m.id);
-    // const assetsWithData = Object.keys(assetPerformance);
-    // if (assetsWithData.length >= 3) {
-    //     allowedAssets = assetsWithData
-    //         .sort((a, b) => parseFloat(assetPerformance[b].wr) - parseFloat(assetPerformance[a].wr))
-    //         .slice(0, 3);
-    // }
+    const assetsWithData = Object.keys(assetPerformance);
+    if (assetsWithData.length >= 3) {
+        allowedAssets = assetsWithData
+            .sort((a, b) => parseFloat(assetPerformance[b].wr) - parseFloat(assetPerformance[a].wr))
+            .slice(0, 3);
+        console.log(`[SCAN] Top 3 activos: ${allowedAssets.join(', ')}`);
+    }
 
     const validSignals = [];
     let tfs = [{ tf: '5M', aggregate: 1 }];
@@ -1442,8 +1441,8 @@ async function globalScan(scanType = 'auto') {
         if (!isB && momentumSlope > 0) isElite = false;
         if (isB && nearResistance) isElite = false;
         if (!isB && nearSupport) isElite = false;
-        // FORCED: Threshold congelado en 54 durante fase de recolección de datos
-        const currentThreshold = PROB_THRESHOLD; // Era: adaptive.getDynamicThreshold()
+        // PRODUCCIÓN: Threshold dinámico con piso agresivo de 60
+        const currentThreshold = Math.max(60, adaptive.getDynamicThreshold());
         if (s.analysis.prob < currentThreshold) isElite = false;
         if (s.analysis.acs < 0.015) isElite = false;
         if (s.analysis.stability < 0.40) isElite = false;
@@ -1472,12 +1471,11 @@ async function globalScan(scanType = 'auto') {
             s.riskScore = adaptiveResult.riskScore;
             s.riskFactors = adaptiveResult.riskFactors;
 
-            // DISABLED: Filtro desactivado durante fase de recolección.
-            // Solo loggea pero NO bloquea. Descomentar el continue para producción.
+            // PRODUCCIÓN: Filtro adaptativo activo
             if (!adaptiveResult.pass) {
                 const riskDetail = adaptiveResult.riskScore > 0 ? ` | RiskScore: ${adaptiveResult.riskScore}/100` : '';
-                console.log(`[FILTRO-LOG] ${s.assetId} ${s.tf} (pasaría bloqueada en prod): ${adaptiveResult.reason}${riskDetail}`);
-                // continue;  // REACTIVAR EN PRODUCCIÓN
+                console.log(`[FILTRO] ${s.assetId} ${s.tf} BLOQUEADA: ${adaptiveResult.reason}${riskDetail}`);
+                continue;
             }
 
             s.isElite = isElite;
@@ -1528,11 +1526,10 @@ async function globalScan(scanType = 'auto') {
                 candlesByAsset[s.assetId]
             );
 
-            // Si el motor adaptativo bloquea este activo, saltear
-            // DISABLED: Bloqueo desactivado durante fase de recolección.
+            // PRODUCCIÓN: Bloqueo adaptativo activo
             if (adaptiveResult.blocked) {
-                console.log(`[ADAPTIVE-LOG] ${s.assetId} (pasaría bloqueada en prod): ${adaptiveResult.blockReason || 'ranking dinámico'} (hiddenRisk: ${adaptiveResult.hiddenRisk || 0})`);
-                // continue;  // REACTIVAR EN PRODUCCIÓN
+                console.log(`[ADAPTIVE] ${s.assetId} BLOQUEADA: ${adaptiveResult.blockReason || 'ranking dinámico'} (hiddenRisk: ${adaptiveResult.hiddenRisk || 0})`);
+                continue;
             }
 
             // Preparar datos para IA antes de enviar mensaje
@@ -1627,6 +1624,19 @@ async function globalScan(scanType = 'auto') {
             s._messageText = msgText;
             s._messageId = sentMsg.message_id;
             SIGNAL_CACHE.set(sigId, { ...s, analysis: { ...s.analysis }, macro: { ...s.macro } });
+
+            // ═══════════════════════════════════════════════════════
+            // GATILLO: Disparar orden al microservicio ExpertOption
+            // ═══════════════════════════════════════════════════════
+            try {
+                await axios.post('http://127.0.0.1:5000/trade', {
+                    asset: s.assetId,
+                    direction: s.analysis.direction
+                }, { timeout: 5000 });
+                console.log(`[TRADE] 🎯 Disparo enviado: ${s.assetId} ${s.analysis.direction}`);
+            } catch (tradeErr) {
+                console.error('[TRADE] Microservicio no disponible:', tradeErr.message);
+            }
 
             // DB: Insertar señal con IA incluida, veredicto siempre PENDIENTE
             await db.insertTrade({
