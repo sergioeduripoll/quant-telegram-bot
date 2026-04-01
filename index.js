@@ -1626,16 +1626,21 @@ async function globalScan(scanType = 'auto') {
             SIGNAL_CACHE.set(sigId, { ...s, analysis: { ...s.analysis }, macro: { ...s.macro } });
 
             // ═══════════════════════════════════════════════════════
-            // GATILLO: Disparar orden al microservicio ExpertOption
+            // GATILLO: Disparar orden al bridge ExpertOption (Render)
             // ═══════════════════════════════════════════════════════
             try {
-                await axios.post('http://127.0.0.1:5000/trade', {
+                const bridgeUrl = process.env.BRIDGE_URL || 'http://127.0.0.1:5000';
+                const bridgeSecret = process.env.BRIDGE_SECRET || '';
+                await axios.post(`${bridgeUrl}/trade`, {
                     asset: s.assetId,
                     direction: s.analysis.direction
-                }, { timeout: 5000 });
+                }, {
+                    timeout: 10000,
+                    headers: bridgeSecret ? { 'Authorization': `Bearer ${bridgeSecret}` } : {}
+                });
                 console.log(`[TRADE] 🎯 Disparo enviado: ${s.assetId} ${s.analysis.direction}`);
             } catch (tradeErr) {
-                console.error('[TRADE] Microservicio no disponible:', tradeErr.message);
+                console.error('[TRADE] Bridge no disponible:', tradeErr.message);
             }
 
             // DB: Insertar señal con IA incluida, veredicto siempre PENDIENTE
