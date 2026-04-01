@@ -1441,8 +1441,8 @@ async function globalScan(scanType = 'auto') {
         if (!isB && momentumSlope > 0) isElite = false;
         if (isB && nearResistance) isElite = false;
         if (!isB && nearSupport) isElite = false;
-        // PRODUCCIÓN: Threshold dinámico con piso agresivo de 60
-        const currentThreshold = Math.max(60, adaptive.getDynamicThreshold());
+        // PRODUCCIÓN: Threshold dinámico con piso agresivo de 55
+        const currentThreshold = Math.max(55, adaptive.getDynamicThreshold());
         if (s.analysis.prob < currentThreshold) isElite = false;
         if (s.analysis.acs < 0.015) isElite = false;
         if (s.analysis.stability < 0.40) isElite = false;
@@ -1453,7 +1453,7 @@ async function globalScan(scanType = 'auto') {
         // --- EVALUACIÓN AGRESIVA ---
         let isAggressive = true;
         if (!passMacro) isAggressive = false;
-        if (s.analysis.prob < 54) isAggressive = false;
+        if (s.analysis.prob < 55) isAggressive = false;
         if (s.analysis.stability < 0.35) isAggressive = false;
         if (s.analysis.n < 12) isAggressive = false;
 
