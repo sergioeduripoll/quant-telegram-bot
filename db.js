@@ -171,6 +171,49 @@ async function cleanupOldTrades(limit = 1000) {
 }
 
 /**
+ * Obtiene trades de HOY (desde 00:00 Argentina, GMT-3).
+ * Retorna { today: [...], todayResolved: [...] }
+ */
+async function getTodayTrades() {
+    try {
+        // Argentina = UTC-3 → 00:00 AR = 03:00 UTC
+        const now = new Date();
+        const utcHour = now.getUTCHours();
+        const todayUTC = new Date(now);
+        todayUTC.setUTCHours(3, 0, 0, 0); // 00:00 Argentina = 03:00 UTC
+        // Si estamos antes de las 03:00 UTC, el "hoy argentino" empezó ayer a las 03:00 UTC
+        if (utcHour < 3) {
+            todayUTC.setUTCDate(todayUTC.getUTCDate() - 1);
+        }
+        const startOfDayISO = todayUTC.toISOString();
+
+        const { data, error } = await supabase
+            .from(TABLE)
+            .select('*')
+            .gte('created_at', startOfDayISO)
+            .order('created_at', { ascending: true });
+
+        if (error) {
+            console.error('[DB_TODAY]', { message: error.message, time: new Date().toISOString() });
+            return { today: [], todayResolved: [] };
+        }
+
+        const rows = (data || []).map(r => ({
+            signal_id: r.signal_id || null,
+            Activo: r.asset,
+            Veredicto: r.veredicto,
+            _win: r.veredicto === 'GANADA' ? 1 : 0
+        }));
+
+        const resolved = rows.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA');
+        return { today: rows, todayResolved: resolved };
+    } catch (e) {
+        console.error('[DB_TODAY]', { message: e.message, time: new Date().toISOString() });
+        return { today: [], todayResolved: [] };
+    }
+}
+
+/**
  * Análisis adaptativo on-demand.
  */
 async function runAdaptiveAnalysis(adaptive) {
@@ -210,6 +253,7 @@ module.exports = {
     insertTrade,
     updateTradeResult,
     getRecentTrades,
+    getTodayTrades,
     cleanupOldTrades,
     runAdaptiveAnalysis
 };
