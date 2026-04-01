@@ -16,10 +16,29 @@ const adaptivePersistence = require('./adaptivePersistence');
 // === CONFIGURACIONES GLOBALES ===
 const token = process.env.TELEGRAM_TOKEN;
 const chatId = process.env.CHAT_ID;
-const bot = new TelegramBot(token, { polling: true });
+
+// FIX 409: Polling resiliente — cancela webhook previo y maneja errores
+const bot = new TelegramBot(token, {
+    polling: {
+        interval: 1000,
+        autoStart: true,
+        params: { timeout: 30 }
+    }
+});
+bot.on('polling_error', (err) => {
+    if (err.code === 'ETELEGRAM' && err.message.includes('409')) {
+        console.error('[TG] ⚠️ Error 409: Otra instancia del bot está corriendo. Verificar que no haya duplicados.');
+    }
+});
+// Limpiar webhook por si quedó uno viejo
+bot.deleteWebHook().then(() => console.log('[TG] Webhook limpiado')).catch(() => {});
 
 const patternLength = 6;
 const PROB_THRESHOLD = 54;
+
+// TEST_MODE: Forzar threshold bajo para pruebas de comunicación con broker
+const TEST_MODE = process.env.TEST_MODE === 'true';
+if (TEST_MODE) console.log('[CONFIG] ⚡ TEST_MODE activo — threshold forzado a 55');
 
 // LOCK: Evita scans simultáneos
 let isScanning = false;
@@ -1441,8 +1460,8 @@ async function globalScan(scanType = 'auto') {
         if (!isB && momentumSlope > 0) isElite = false;
         if (isB && nearResistance) isElite = false;
         if (!isB && nearSupport) isElite = false;
-        // PRODUCCIÓN: Threshold dinámico con piso agresivo de 55
-        const currentThreshold = 55;
+        // TEST_MODE: threshold 55 para pruebas | PRODUCCIÓN: dinámico con piso 60
+        const currentThreshold = TEST_MODE ? 55 : Math.max(60, adaptive.getDynamicThreshold());
         if (s.analysis.prob < currentThreshold) isElite = false;
         if (s.analysis.acs < 0.015) isElite = false;
         if (s.analysis.stability < 0.40) isElite = false;
@@ -1453,7 +1472,7 @@ async function globalScan(scanType = 'auto') {
         // --- EVALUACIÓN AGRESIVA ---
         let isAggressive = true;
         if (!passMacro) isAggressive = false;
-        if (s.analysis.prob < 55) isAggressive = false;
+        if (s.analysis.prob < 54) isAggressive = false;
         if (s.analysis.stability < 0.35) isAggressive = false;
         if (s.analysis.n < 12) isAggressive = false;
 
@@ -1631,16 +1650,17 @@ async function globalScan(scanType = 'auto') {
             try {
                 const bridgeUrl = process.env.BRIDGE_URL || 'http://127.0.0.1:5000';
                 const bridgeSecret = process.env.BRIDGE_SECRET || '';
-                await axios.post(`${bridgeUrl}/trade`, {
+                console.log(`[BRIDGE_SEND] =====> Enviando petición a Render para ${s.assetId} ${s.analysis.direction} | URL: ${bridgeUrl}/trade`);
+                const bridgeRes = await axios.post(`${bridgeUrl}/trade`, {
                     asset: s.assetId,
                     direction: s.analysis.direction
                 }, {
                     timeout: 10000,
                     headers: bridgeSecret ? { 'Authorization': `Bearer ${bridgeSecret}` } : {}
                 });
-                console.log(`[TRADE] 🎯 Disparo enviado: ${s.assetId} ${s.analysis.direction}`);
+                console.log(`[BRIDGE_SEND] ✅ Respuesta: ${JSON.stringify(bridgeRes.data)}`);
             } catch (tradeErr) {
-                console.error('[TRADE] Bridge no disponible:', tradeErr.message);
+                console.error(`[BRIDGE_SEND] ❌ Error: ${tradeErr.message}`);
             }
 
             // DB: Insertar señal con IA incluida, veredicto siempre PENDIENTE
