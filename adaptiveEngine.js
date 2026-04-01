@@ -137,16 +137,14 @@ function thresholdRecordResult(isWin) {
     totalTradesForThreshold++;
     if (isWin) totalWinsForThreshold++;
 
-    // FROZEN: Threshold congelado en 54 durante fase de recolección de datos.
-    // Descomentar el bloque de abajo cuando se reactive el modo producción.
-    //
-    // if (totalTradesForThreshold % 20 === 0 && totalTradesForThreshold > 0) {
-    //     const wr = totalWinsForThreshold / totalTradesForThreshold;
-    //     if (wr < 0.55) dynamicThreshold += 1;
-    //     if (wr > 0.65) dynamicThreshold -= 1;
-    //     dynamicThreshold = clamp(dynamicThreshold, 50, 65);
-    //     console.log(`[ADAPTIVE] Threshold ajustado a ${dynamicThreshold} (WR: ${(wr * 100).toFixed(1)}% sobre ${totalTradesForThreshold} trades)`);
-    // }
+    // PRODUCCIÓN: Auto-ajuste de threshold activo
+    if (totalTradesForThreshold % 20 === 0 && totalTradesForThreshold > 0) {
+        const wr = totalWinsForThreshold / totalTradesForThreshold;
+        if (wr < 0.55) dynamicThreshold += 1;
+        if (wr > 0.65) dynamicThreshold -= 1;
+        dynamicThreshold = clamp(dynamicThreshold, 50, 65);
+        console.log(`[ADAPTIVE] Threshold ajustado a ${dynamicThreshold} (WR: ${(wr * 100).toFixed(1)}% sobre ${totalTradesForThreshold} trades)`);
+    }
 }
 
 // FIX #9: Preparación para per-asset threshold (función extraída)
