@@ -1072,7 +1072,7 @@ REASONING: (2 oraciones).`;
 
 bot.onText(/\/start/, (msg) => {
     if (msg.chat.id.toString() === chatId) {
-        bot.sendMessage(chatId, '👋 *Quant Sniper V15 SUPABASE* operativo.\n🧠 Motor adaptativo + RL + IA on-demand.\n\n/scan — Escaneo manual\n/profile — Perfiles adaptativos\n/stats — Estadísticas\n/analyze — Análisis adaptativo', { parse_mode: 'Markdown' });
+        bot.sendMessage(chatId, '👋 *Quant Sniper V15 SUPABASE* operativo.\n🧠 Motor adaptativo + RL + IA on-demand.\n\n/scan — Escaneo manual\n/profile — Perfiles adaptativos\n/stats — Estadísticas (hoy + global)\n/analyze — Análisis adaptativo\n/broker — Estado del broker', { parse_mode: 'Markdown' });
     }
 });
 
@@ -1116,20 +1116,28 @@ bot.onText(/\/profile/, async (msg) => {
 
 bot.onText(/\/stats/, async (msg) => {
     if (msg.chat.id.toString() === chatId) {
-        // DB: Cargar trades resueltos desde Supabase
         const allRows = await db.getRecentTrades(1000);
         const resolved = allRows.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA');
-        if (resolved.length === 0) {
-            bot.sendMessage(chatId, '📊 Sin trades resueltos aún.');
+
+        // Trades de hoy (GMT-3 Argentina)
+        const { todayResolved } = await db.getTodayTrades();
+        const todayW = todayResolved.filter(r => r._win === 1).length;
+        const todayL = todayResolved.length - todayW;
+        const todayWR = todayResolved.length > 0 ? (todayW / todayResolved.length * 100).toFixed(1) : '0.0';
+
+        if (resolved.length === 0 && todayResolved.length === 0) {
+            await safeSend('Sin trades resueltos aun.');
             return;
         }
 
         const totalW = resolved.filter(r => r._win === 1).length;
-        const totalL = resolved.filter(r => r._win === 0).length;
+        const totalL = resolved.length - totalW;
+        const globalWR = resolved.length > 0 ? (totalW / resolved.length * 100).toFixed(1) : '0.0';
 
-        let text = `📊 *ESTADÍSTICAS GLOBALES*\n\n`;
-        text += `Total: ${resolved.length} | ✅ ${totalW} | ❌ ${totalL}\n`;
-        text += `WR Global: ${(totalW / resolved.length * 100).toFixed(1)}%\n\n`;
+        let text = 'SESION HOY (GMT-3)\n';
+        text += `Trades: ${todayResolved.length} | W: ${todayW} | L: ${todayL} | WR: ${todayWR}%\n\n`;
+        text += 'HISTORIAL GLOBAL\n';
+        text += `Trades: ${resolved.length} | W: ${totalW} | L: ${totalL} | WR: ${globalWR}%\n\n`;
 
         for (const market of CONFIG.MARKETS) {
             const ar = resolved.filter(r => r.Activo === market.id);
@@ -1140,7 +1148,7 @@ bot.onText(/\/stats/, async (msg) => {
             text += `${market.id}: ${bar} ${wr}% (${ar.length})\n`;
         }
 
-        bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+        await safeSend(text);
     }
 });
 
@@ -1816,19 +1824,33 @@ setInterval(() => {
 // Comando /analyze — Análisis adaptativo on-demand
 bot.onText(/\/analyze/, async (msg) => {
     if (msg.chat.id.toString() === chatId) {
-        await safeSend('🧠 Ejecutando análisis adaptativo...');
+        await safeSend('Ejecutando analisis adaptativo...');
 
         try {
             const summary = await db.runAdaptiveAnalysis(adaptive);
 
             if (summary.trades === 0) {
-                await safeSend('📊 Sin trades resueltos en DB.');
+                await safeSend('Sin trades resueltos en DB.');
                 return;
             }
 
-            let text = '🧠 ANÁLISIS ADAPTATIVO\n\n';
+            // Datos de hoy
+            const { todayResolved } = await db.getTodayTrades();
+            const todayW = todayResolved.filter(r => r._win === 1).length;
+            const todayWR = todayResolved.length > 0 ? (todayW / todayResolved.length * 100).toFixed(1) : '0.0';
+            const globalWR = summary.trades > 0 ? ((summary.topAssets.reduce((a, x) => a + parseFloat(x.wr) * x.trades, 0) / summary.topAssets.reduce((a, x) => a + x.trades, 0)) || 0).toFixed(1) : '0.0';
+
+            // Comparativa
+            const todayNum = parseFloat(todayWR);
+            const globalNum = parseFloat(globalWR);
+            const trend = todayNum > globalNum ? 'Hoy MEJOR que el global' : (todayNum < globalNum ? 'Hoy PEOR que el global' : 'Hoy igual al global');
+
+            let text = 'ANALISIS ADAPTATIVO\n\n';
             text += `Trades analizados: ${summary.trades}\n`;
             text += `Threshold: ${summary.threshold}\n\n`;
+            text += `HOY: ${todayResolved.length}t | WR: ${todayWR}%\n`;
+            text += `GLOBAL WR: ${globalWR}%\n`;
+            text += `Tendencia: ${trend}\n\n`;
 
             if (summary.topAssets.length > 0) {
                 text += 'Top Assets:\n';
@@ -1847,7 +1869,30 @@ bot.onText(/\/analyze/, async (msg) => {
             await safeSend(text);
         } catch (e) {
             console.error('[ANALYZE]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
-            await safeSend('❌ Error en análisis. Ver logs.');
+            await safeSend('Error en analisis. Ver logs.');
+        }
+    }
+});
+
+// Comando /broker — Verificar estado del bridge ExpertOption
+bot.onText(/\/broker/, async (msg) => {
+    if (msg.chat.id.toString() === chatId) {
+        try {
+            const bridgeUrl = process.env.BRIDGE_URL || 'http://127.0.0.1:5000';
+            const bridgeSecret = process.env.BRIDGE_SECRET || '';
+            const res = await axios.get(`${bridgeUrl}/broker-status`, {
+                timeout: 10000,
+                headers: bridgeSecret ? { 'Authorization': `Bearer ${bridgeSecret}` } : {}
+            });
+            const d = res.data;
+            if (d.connected) {
+                const balanceText = d.balance !== null ? `$${d.balance}` : 'N/A';
+                await safeSend(`Broker: CONECTADO\nCuenta: ${d.mode}\nSaldo: ${balanceText}`);
+            } else {
+                await safeSend(`Broker: DESCONECTADO\n${d.message || 'Sin conexion activa'}`);
+            }
+        } catch (e) {
+            await safeSend(`Broker: ERROR\n${e.message}`);
         }
     }
 });
