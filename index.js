@@ -1677,12 +1677,20 @@ async function globalScan(scanType = 'auto') {
             try {
                 const bridgeUrl = process.env.BRIDGE_URL || 'http://127.0.0.1:5000';
                 const bridgeSecret = process.env.BRIDGE_SECRET || '';
-                console.log(`[BRIDGE_SEND] =====> Enviando petición a Render para ${s.assetId} ${s.analysis.direction} | URL: ${bridgeUrl}/trade`);
+
+                // Pre-warm: despertar Render si está dormido (free tier duerme tras 15min)
+                try {
+                    await axios.get(`${bridgeUrl}/health`, { timeout: 55000 });
+                } catch (warmErr) {
+                    console.log(`[BRIDGE_SEND] ⏳ Render despertando...`);
+                }
+
+                console.log(`[BRIDGE_SEND] =====> Enviando ${s.assetId} ${s.analysis.direction} a ${bridgeUrl}/trade`);
                 const bridgeRes = await axios.post(`${bridgeUrl}/trade`, {
                     asset: s.assetId,
                     direction: s.analysis.direction
                 }, {
-                    timeout: 10000,
+                    timeout: 60000,
                     headers: bridgeSecret ? { 'Authorization': `Bearer ${bridgeSecret}` } : {}
                 });
                 console.log(`[BRIDGE_SEND] ✅ Respuesta: ${JSON.stringify(bridgeRes.data)}`);
@@ -1900,7 +1908,7 @@ bot.onText(/\/broker/, async (msg) => {
             const bridgeUrl = process.env.BRIDGE_URL || 'http://127.0.0.1:5000';
             const bridgeSecret = process.env.BRIDGE_SECRET || '';
             const res = await axios.get(`${bridgeUrl}/broker-status`, {
-                timeout: 10000,
+                timeout: 60000,
                 headers: bridgeSecret ? { 'Authorization': `Bearer ${bridgeSecret}` } : {}
             });
             const d = res.data;
