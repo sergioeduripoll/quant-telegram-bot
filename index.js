@@ -1886,8 +1886,14 @@ bot.onText(/\/broker/, async (msg) => {
             });
             const d = res.data;
             if (d.connected) {
-                const balanceText = d.balance !== null ? `$${d.balance}` : 'N/A';
-                await safeSend(`Broker: CONECTADO\nCuenta: ${d.mode}\nSaldo: ${balanceText}`);
+                const balanceText = d.balance !== null ? `$${d.balance}` : 'N/A (ver logs Render)';
+                let text = `Broker: CONECTADO\nCuenta: ${d.mode}\nSaldo: ${balanceText}`;
+                // Mostrar métodos disponibles si hay debug
+                if (d.debug && d.debug.available_methods) {
+                    const methods = d.debug.available_methods.substring(0, 200);
+                    text += `\n\nMetodos API: ${methods}`;
+                }
+                await safeSend(text);
             } else {
                 await safeSend(`Broker: DESCONECTADO\n${d.message || 'Sin conexion activa'}`);
             }
