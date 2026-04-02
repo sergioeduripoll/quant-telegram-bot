@@ -1921,3 +1921,38 @@ bot.onText(/\/broker/, async (msg) => {
         }
     }
 });
+
+// Comando /assets — Descubrir IDs reales de activos en ExpertOption
+bot.onText(/\/assets/, async (msg) => {
+    if (msg.chat.id.toString() === chatId) {
+        await safeSend('Consultando assets del broker...');
+        try {
+            const bridgeUrl = process.env.BRIDGE_URL || 'http://127.0.0.1:5000';
+            const bridgeSecret = process.env.BRIDGE_SECRET || '';
+            const res = await axios.get(`${bridgeUrl}/debug-assets`, {
+                timeout: 15000,
+                headers: bridgeSecret ? { 'Authorization': `Bearer ${bridgeSecret}` } : {}
+            });
+            const d = res.data;
+
+            let text = 'DEBUG ASSETS\n\n';
+
+            if (d.msg_by_action_keys) {
+                text += `Keys WS: ${JSON.stringify(d.msg_by_action_keys).substring(0, 300)}\n\n`;
+            }
+            if (d.assets_raw) {
+                text += `Assets: ${d.assets_raw.substring(0, 500)}\n\n`;
+            }
+            if (d.crypto_matches && typeof d.crypto_matches === 'object') {
+                text += `Crypto encontrados: ${JSON.stringify(d.crypto_matches).substring(0, 500)}\n`;
+            }
+
+            // Truncar si es muy largo
+            if (text.length > 3500) text = text.substring(0, 3500) + '...\n\n(Ver logs Render para datos completos)';
+
+            await safeSend(text);
+        } catch (e) {
+            await safeSend(`Error: ${e.message}`);
+        }
+    }
+});
