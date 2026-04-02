@@ -873,9 +873,9 @@ function runAnalysisElite(candles) {
     const recentCandles = candles.slice(-50);
 
     const entropy = marketEntropy(recentCandles);
-    if (entropy > 0.998) return null;
+    if (!TEST_MODE && entropy > 0.998) return null;
     const zScore = calculateZScore(recentCandles.map(c => c.c));
-    if (Math.abs(zScore) > 2.5) return null;
+    if (!TEST_MODE && Math.abs(zScore) > 2.5) return null;
 
     const regime = detectRegime(candles);
     const atrs = precalcATR(candles);
@@ -915,7 +915,9 @@ function runAnalysisElite(candles) {
     }
     matches = Array.from(uniqueMatchesMap.values());
 
-    if (matches.length < 15) return null;
+    // TEST_MODE: Relajar mínimo de matches (5 vs 15)
+    const minMatches = TEST_MODE ? 5 : 15;
+    if (matches.length < minMatches) return null;
     matches.sort((a,b) => b.sim - a.sim);
 
     const eliteCount = Math.min(250, Math.max(15, Math.floor(matches.length * 0.10)));
@@ -947,11 +949,14 @@ function runAnalysisElite(candles) {
     const finalProb = signal === "BUY" ? prob : 100 - prob;
     const edge = finalProb - CONFIG.BE;
 
-    if (
-        edge < 1.2 ||
-        (regime === "COMPRESSION" && edge < 6) ||
-        (regime === "TREND" && edge < 0.3)
-    ) return null;
+    // TEST_MODE: Saltear filtro estricto de edge para pruebas mecánicas
+    if (!TEST_MODE) {
+        if (
+            edge < 1.2 ||
+            (regime === "COMPRESSION" && edge < 6) ||
+            (regime === "TREND" && edge < 0.3)
+        ) return null;
+    }
 
     return {
         prob: finalProb,
@@ -1489,6 +1494,12 @@ async function globalScan(scanType = 'auto') {
         if (!isB && momentumSlope > 0.0001) passMomentumAgr = false;
         if (!passMomentumAgr) isAggressive = false;
 
+        // TEST_MODE: Forzar señal como AGRESIVA para probar ejecución mecánica
+        if (TEST_MODE && !isElite && !isAggressive && s.analysis) {
+            isAggressive = true;
+            console.log(`[TEST_MODE] ${s.assetId} ${s.tf} forzada como AGRESIVA (prob: ${s.analysis.prob.toFixed(1)}%)`);
+        }
+
         if (isElite || isAggressive) {
             // --- FILTRO ADAPTATIVO + HIDDEN RISK ---
             const adaptiveResult = applyAdaptiveFilter(s);
@@ -1498,11 +1509,15 @@ async function globalScan(scanType = 'auto') {
             s.riskScore = adaptiveResult.riskScore;
             s.riskFactors = adaptiveResult.riskFactors;
 
-            // PRODUCCIÓN: Filtro adaptativo activo
+            // PRODUCCIÓN: Filtro adaptativo activo | TEST_MODE: solo loguea
             if (!adaptiveResult.pass) {
                 const riskDetail = adaptiveResult.riskScore > 0 ? ` | RiskScore: ${adaptiveResult.riskScore}/100` : '';
-                console.log(`[FILTRO] ${s.assetId} ${s.tf} BLOQUEADA: ${adaptiveResult.reason}${riskDetail}`);
-                continue;
+                if (TEST_MODE) {
+                    console.log(`[TEST_MODE] ${s.assetId} ${s.tf} filtro bypaseado: ${adaptiveResult.reason}${riskDetail}`);
+                } else {
+                    console.log(`[FILTRO] ${s.assetId} ${s.tf} BLOQUEADA: ${adaptiveResult.reason}${riskDetail}`);
+                    continue;
+                }
             }
 
             s.isElite = isElite;
@@ -1553,10 +1568,14 @@ async function globalScan(scanType = 'auto') {
                 candlesByAsset[s.assetId]
             );
 
-            // PRODUCCIÓN: Bloqueo adaptativo activo
+            // PRODUCCIÓN: Bloqueo adaptativo activo | TEST_MODE: solo loguea
             if (adaptiveResult.blocked) {
-                console.log(`[ADAPTIVE] ${s.assetId} BLOQUEADA: ${adaptiveResult.blockReason || 'ranking dinámico'} (hiddenRisk: ${adaptiveResult.hiddenRisk || 0})`);
-                continue;
+                if (TEST_MODE) {
+                    console.log(`[TEST_MODE] ${s.assetId} bloqueo bypaseado: ${adaptiveResult.blockReason || 'ranking dinámico'}`);
+                } else {
+                    console.log(`[ADAPTIVE] ${s.assetId} BLOQUEADA: ${adaptiveResult.blockReason || 'ranking dinámico'} (hiddenRisk: ${adaptiveResult.hiddenRisk || 0})`);
+                    continue;
+                }
             }
 
             // Preparar datos para IA antes de enviar mensaje
