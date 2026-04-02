@@ -1469,7 +1469,7 @@ async function globalScan(scanType = 'auto') {
         if (isB && nearResistance) isElite = false;
         if (!isB && nearSupport) isElite = false;
         // TEST_MODE: threshold 55 para pruebas | PRODUCCIÓN: dinámico con piso 60
-        const currentThreshold = TEST_MODE ? 55 : Math.max(60, adaptive.getDynamicThreshold());
+        const currentThreshold = TEST_MODE ? 25 : Math.max(60, adaptive.getDynamicThreshold());
         if (s.analysis.prob < currentThreshold) isElite = false;
         if (s.analysis.acs < 0.015) isElite = false;
         if (s.analysis.stability < 0.40) isElite = false;
