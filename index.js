@@ -71,7 +71,7 @@ const DEFAULT_ZONES = {
 
 let CURRENT_WINNING_ZONES = JSON.parse(JSON.stringify(DEFAULT_ZONES));
 const SIGNAL_CACHE = new Map();
-let signalCounter = 0;
+// signalCounter eliminado — usamos timestamp único para evitar colisiones en redeploy
 const PENDING_AUDITS = [];
 
 // Control Anti-Ruina Progresivo y Cache Global
@@ -1540,7 +1540,7 @@ async function globalScan(scanType = 'auto') {
         // }
 
         for (const s of consensusSignals) {
-            const sigId = `sig_${signalCounter++}`;
+            const sigId = `sig_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
             const icon = s.analysis.direction === 'BUY' ? '🟢' : '🔴';
             const timeData = getRecommendedTimeData(s.tf, currentServerTime);
 
