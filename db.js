@@ -164,29 +164,23 @@ async function cleanupOldTrades(limit = 1000) {
 }
 
 /**
- * FIX PROBLEMA 4: Obtiene trades de HOY (GMT-3 Argentina).
- *
- * Usa Intl.DateTimeFormat para obtener la fecha exacta en Buenos Aires,
- * luego construye manualmente los rangos UTC sabiendo que 00:00 AR = 03:00 UTC.
+ * Obtiene trades de HOY en UTC puro.
+ * 00:00:00.000Z → 23:59:59.999Z del día UTC actual.
  */
 async function getTodayTrades() {
     try {
-        // 1. Obtener fecha local argentina usando Intl (a prueba de DST)
-        const nowUTC = new Date();
-        const arFormatter = new Intl.DateTimeFormat('en-CA', {
-            timeZone: 'America/Argentina/Buenos_Aires',
-            year: 'numeric', month: '2-digit', day: '2-digit'
-        });
-        // Formato en-CA da YYYY-MM-DD
-        const arDateStr = arFormatter.format(nowUTC); // ej: "2026-04-03"
+        const now = new Date();
 
-        // 2. 00:00:00 Argentina = 03:00:00 UTC del mismo día
-        const startISO = `${arDateStr}T03:00:00.000Z`;
+        // Inicio del día UTC: hoy a las 00:00:00.000Z
+        const startUTC = new Date(now);
+        startUTC.setUTCHours(0, 0, 0, 0);
 
-        // 3. 23:59:59.999 Argentina = 03:00 UTC del día siguiente - 1ms
-        //    = startISO + 24h - 1ms
-        const startMs = new Date(startISO).getTime();
-        const endISO = new Date(startMs + 24 * 60 * 60 * 1000 - 1).toISOString();
+        // Fin del día UTC: hoy a las 23:59:59.999Z
+        const endUTC = new Date(now);
+        endUTC.setUTCHours(23, 59, 59, 999);
+
+        const startISO = startUTC.toISOString();
+        const endISO = endUTC.toISOString();
 
         const { data, error } = await supabase
             .from(TABLE)
