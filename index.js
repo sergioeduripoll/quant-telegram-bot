@@ -1685,10 +1685,11 @@ async function globalScan(scanType = 'auto') {
                     console.log(`[BRIDGE_SEND] ⏳ Render despertando...`);
                 }
 
-                console.log(`[BRIDGE_SEND] =====> Enviando ${s.assetId} ${s.analysis.direction} a ${bridgeUrl}/trade`);
+                console.log(`[BRIDGE_SEND] =====> Enviando ${s.assetId} ${s.analysis.direction} ${s.tf} a ${bridgeUrl}/trade`);
                 const bridgeRes = await axios.post(`${bridgeUrl}/trade`, {
                     asset: s.assetId,
-                    direction: s.analysis.direction
+                    direction: s.analysis.direction,
+                    tf: s.tf
                 }, {
                     timeout: 60000,
                     headers: bridgeSecret ? { 'Authorization': `Bearer ${bridgeSecret}` } : {}
