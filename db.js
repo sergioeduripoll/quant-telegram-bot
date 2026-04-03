@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════
-// db.js — Capa de persistencia Supabase
+// db.js — Capa de persistencia Supabase (v2 — timezone fix)
 // ═══════════════════════════════════════════════════════════════════
 
 const { createClient } = require('@supabase/supabase-js');
@@ -12,12 +12,10 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
 const TABLE = 'trades';
 
 /**
  * Inserta un trade nuevo en Supabase.
- * FIX: Incluye signal_id para identificación única y prevenir duplicados.
  */
 async function insertTrade(trade) {
     try {
@@ -42,7 +40,6 @@ async function insertTrade(trade) {
             mode: trade.mode || ''
         });
         if (error) {
-            // AUDIT FIX #5: Ignorar duplicados silenciosamente (UNIQUE violation)
             if (error.code === '23505') {
                 console.log(`[DB_INSERT] Duplicado ignorado: ${trade.signalId}`);
                 return;
@@ -50,14 +47,12 @@ async function insertTrade(trade) {
             console.error('[DB_INSERT]', { message: error.message, code: error.code, time: new Date().toISOString() });
         }
     } catch (e) {
-        console.error('[DB_INSERT]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
+        console.error('[DB_INSERT]', { message: e.message, time: new Date().toISOString() });
     }
 }
 
 /**
- * FIX: Actualiza un trade existente por signal_id.
- * Usado por auditoría (GANADA/PERDIDA) e IA (IA_ANALIZADA) para
- * actualizar la misma fila en vez de insertar duplicados.
+ * Actualiza un trade existente por signal_id.
  */
 async function updateTradeResult(signalId, data) {
     if (!signalId) {
@@ -82,13 +77,12 @@ async function updateTradeResult(signalId, data) {
             console.error('[DB_UPDATE]', { signalId, message: error.message, time: new Date().toISOString() });
         }
     } catch (e) {
-        console.error('[DB_UPDATE]', { signalId, message: e.message, stack: e.stack, time: new Date().toISOString() });
+        console.error('[DB_UPDATE]', { signalId, message: e.message, time: new Date().toISOString() });
     }
 }
 
 /**
- * Obtiene los últimos N trades (DESC luego reverse para cronológico).
- * FIX #6: Solo mapea _win para trades resueltos.
+ * Obtiene los últimos N trades.
  */
 async function getRecentTrades(limit = 1000) {
     try {
@@ -131,11 +125,10 @@ async function getRecentTrades(limit = 1000) {
             _cwev: r.cwev || 0,
             _alpha: r.alpha || 0,
             _samples: r.samples || 0,
-            // FIX #6: _win solo tiene sentido para trades resueltos
             _win: r.veredicto === 'GANADA' ? 1 : 0
         }));
     } catch (e) {
-        console.error('[DB_SELECT]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
+        console.error('[DB_SELECT]', { message: e.message, time: new Date().toISOString() });
         return [];
     }
 }
@@ -166,31 +159,47 @@ async function cleanupOldTrades(limit = 1000) {
             console.log(`[DB_CLEANUP] ${count} trades antiguos eliminados`);
         }
     } catch (e) {
-        console.error('[DB_CLEANUP]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
+        console.error('[DB_CLEANUP]', { message: e.message, time: new Date().toISOString() });
     }
 }
 
 /**
- * Obtiene trades de HOY (desde 00:00 Argentina, GMT-3).
- * Retorna { today: [...], todayResolved: [...] }
+ * FIX PROBLEMA 4: Obtiene trades de HOY (GMT-3 Argentina).
+ * 
+ * Lógica correcta:
+ * 1. Calcula "ahora" en Argentina (UTC - 3 horas)
+ * 2. Construye 00:00:00 del día argentino
+ * 3. Convierte ese 00:00 AR a UTC (+3 horas) para el filtro de Supabase
+ * 4. Construye 23:59:59 del día argentino en UTC para el límite superior
  */
 async function getTodayTrades() {
     try {
-        // Argentina = UTC-3 → 00:00 AR = 03:00 UTC
-        const now = new Date();
-        const utcHour = now.getUTCHours();
-        const todayUTC = new Date(now);
-        todayUTC.setUTCHours(3, 0, 0, 0); // 00:00 Argentina = 03:00 UTC
-        // Si estamos antes de las 03:00 UTC, el "hoy argentino" empezó ayer a las 03:00 UTC
-        if (utcHour < 3) {
-            todayUTC.setUTCDate(todayUTC.getUTCDate() - 1);
-        }
-        const startOfDayISO = todayUTC.toISOString();
+        // Hora actual UTC
+        const nowUTC = new Date();
+
+        // "Ahora" en Argentina = UTC - 3 horas
+        const nowAR = new Date(nowUTC.getTime() - 3 * 60 * 60 * 1000);
+
+        // 00:00:00 del día argentino (en tiempo AR)
+        const startOfDayAR = new Date(nowAR);
+        startOfDayAR.setHours(0, 0, 0, 0);
+
+        // Convertir 00:00 AR → UTC (+3 horas)
+        const startOfDayUTC = new Date(startOfDayAR.getTime() + 3 * 60 * 60 * 1000);
+
+        // 23:59:59 del día argentino → UTC
+        const endOfDayAR = new Date(nowAR);
+        endOfDayAR.setHours(23, 59, 59, 999);
+        const endOfDayUTC = new Date(endOfDayAR.getTime() + 3 * 60 * 60 * 1000);
+
+        const startISO = startOfDayUTC.toISOString();
+        const endISO = endOfDayUTC.toISOString();
 
         const { data, error } = await supabase
             .from(TABLE)
             .select('*')
-            .gte('created_at', startOfDayISO)
+            .gte('created_at', startISO)
+            .lte('created_at', endISO)
             .order('created_at', { ascending: true });
 
         if (error) {
@@ -218,14 +227,12 @@ async function getTodayTrades() {
  */
 async function runAdaptiveAnalysis(adaptive) {
     const rows = await getRecentTrades(1000);
-    // FIX #6: Filtro estricto — solo resueltos
     const resolved = rows.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA');
 
     if (resolved.length === 0) {
         return { trades: 0, message: 'Sin trades resueltos en DB' };
     }
 
-    // FIX: incremental en vez de bootstrap — evita timeout con muchos trades
     adaptive.learnFromCSV(resolved, 'incremental');
 
     const threshold = adaptive.getDynamicThreshold();
