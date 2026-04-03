@@ -165,35 +165,28 @@ async function cleanupOldTrades(limit = 1000) {
 
 /**
  * FIX PROBLEMA 4: Obtiene trades de HOY (GMT-3 Argentina).
- * 
- * Lógica correcta:
- * 1. Calcula "ahora" en Argentina (UTC - 3 horas)
- * 2. Construye 00:00:00 del día argentino
- * 3. Convierte ese 00:00 AR a UTC (+3 horas) para el filtro de Supabase
- * 4. Construye 23:59:59 del día argentino en UTC para el límite superior
+ *
+ * Usa Intl.DateTimeFormat para obtener la fecha exacta en Buenos Aires,
+ * luego construye manualmente los rangos UTC sabiendo que 00:00 AR = 03:00 UTC.
  */
 async function getTodayTrades() {
     try {
-        // Hora actual UTC
+        // 1. Obtener fecha local argentina usando Intl (a prueba de DST)
         const nowUTC = new Date();
+        const arFormatter = new Intl.DateTimeFormat('en-CA', {
+            timeZone: 'America/Argentina/Buenos_Aires',
+            year: 'numeric', month: '2-digit', day: '2-digit'
+        });
+        // Formato en-CA da YYYY-MM-DD
+        const arDateStr = arFormatter.format(nowUTC); // ej: "2026-04-03"
 
-        // "Ahora" en Argentina = UTC - 3 horas
-        const nowAR = new Date(nowUTC.getTime() - 3 * 60 * 60 * 1000);
+        // 2. 00:00:00 Argentina = 03:00:00 UTC del mismo día
+        const startISO = `${arDateStr}T03:00:00.000Z`;
 
-        // 00:00:00 del día argentino (en tiempo AR)
-        const startOfDayAR = new Date(nowAR);
-        startOfDayAR.setHours(0, 0, 0, 0);
-
-        // Convertir 00:00 AR → UTC (+3 horas)
-        const startOfDayUTC = new Date(startOfDayAR.getTime() + 3 * 60 * 60 * 1000);
-
-        // 23:59:59 del día argentino → UTC
-        const endOfDayAR = new Date(nowAR);
-        endOfDayAR.setHours(23, 59, 59, 999);
-        const endOfDayUTC = new Date(endOfDayAR.getTime() + 3 * 60 * 60 * 1000);
-
-        const startISO = startOfDayUTC.toISOString();
-        const endISO = endOfDayUTC.toISOString();
+        // 3. 23:59:59.999 Argentina = 03:00 UTC del día siguiente - 1ms
+        //    = startISO + 24h - 1ms
+        const startMs = new Date(startISO).getTime();
+        const endISO = new Date(startMs + 24 * 60 * 60 * 1000 - 1).toISOString();
 
         const { data, error } = await supabase
             .from(TABLE)
