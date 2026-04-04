@@ -164,23 +164,17 @@ async function cleanupOldTrades(limit = 1000) {
 }
 
 /**
- * Obtiene trades de HOY en UTC puro.
- * 00:00:00.000Z → 23:59:59.999Z del día UTC actual.
+ * Obtiene trades de HOY (GMT-3 Argentina).
  */
 async function getTodayTrades() {
     try {
-        const now = new Date();
+        const options = { timeZone: 'America/Argentina/Buenos_Aires', year: 'numeric', month: '2-digit', day: '2-digit' };
+        const formatter = new Intl.DateTimeFormat('en-CA', options); 
+        const arDate = formatter.format(new Date()); 
 
-        // Inicio del día UTC: hoy a las 00:00:00.000Z
-        const startUTC = new Date(now);
-        startUTC.setUTCHours(0, 0, 0, 0);
-
-        // Fin del día UTC: hoy a las 23:59:59.999Z
-        const endUTC = new Date(now);
-        endUTC.setUTCHours(23, 59, 59, 999);
-
-        const startISO = startUTC.toISOString();
-        const endISO = endUTC.toISOString();
+        const startISO = `${arDate}T03:00:00.000Z`; 
+        const endDate = new Date(new Date(startISO).getTime() + 24 * 60 * 60 * 1000 - 1);
+        const endISO = endDate.toISOString();
 
         const { data, error } = await supabase
             .from(TABLE)
@@ -190,7 +184,7 @@ async function getTodayTrades() {
             .order('created_at', { ascending: true });
 
         if (error) {
-            console.error('[DB_TODAY]', { message: error.message, time: new Date().toISOString() });
+            console.error('[DB_TODAY]', { message: error.message });
             return { today: [], todayResolved: [] };
         }
 
@@ -204,7 +198,7 @@ async function getTodayTrades() {
         const resolved = rows.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA');
         return { today: rows, todayResolved: resolved };
     } catch (e) {
-        console.error('[DB_TODAY]', { message: e.message, time: new Date().toISOString() });
+        console.error('[DB_TODAY]', { message: e.message });
         return { today: [], todayResolved: [] };
     }
 }
