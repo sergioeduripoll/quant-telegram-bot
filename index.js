@@ -1000,6 +1000,17 @@ async function safeSend(text) {
 // ═══════════════════════════════════════════════════════════════════
 
 async function executeIAAnalysis(s, modeString) {
+    // MOCK TEMPORAL PARA AHORRAR API QUOTA DURANTE TESTS
+    console.log('[IA_MOCK] Simulando respuesta de IA para no gastar API.');
+    return {
+        iaScore: 85,
+        iaContext: 'CONTINUATION',
+        iaReasoning: 'MOCK: IA desactivada temporalmente por pruebas de broker.',
+        iaVerdict: 'EXECUTE',
+        isExecute: true
+    };
+
+    // ═══ CÓDIGO ORIGINAL DE IA (preservado para reactivar) ═══
     if (!s || !s.analysis) return null;
 
     const assetContext = getAssetLearningContext(s.assetId);
