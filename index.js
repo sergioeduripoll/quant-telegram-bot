@@ -1001,9 +1001,10 @@ async function safeSend(text) {
 
 async function executeIAAnalysis(s, modeString) {
     // MOCK TEMPORAL PARA AHORRAR API QUOTA DURANTE TESTS
+    // iaScore=65 para NO disparar V16-TRAP (bloquea si score>70 + cwev<3)
     console.log('[IA_MOCK] Simulando respuesta de IA para no gastar API.');
     return {
-        iaScore: 85,
+        iaScore: 65,
         iaContext: 'CONTINUATION',
         iaReasoning: 'MOCK: IA desactivada temporalmente por pruebas de broker.',
         iaVerdict: 'EXECUTE',
