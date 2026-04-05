@@ -1619,25 +1619,6 @@ async function globalScan(scanType = 'auto') {
                 continue;
             }
 
-            // B. INVERSOR CONTRARIAN: combos con WR < 40% sobre 20+ trades
-            //    XRP/USD BUY: 38.5% → invertido 61.5% (52t)
-            //    XRP/USD SELL: 38.1% → invertido 61.9% (42t)
-            //    SOL/USD BUY: 36.4% → invertido 63.6% (22t)
-            const KAMIKAZE_COMBOS = [
-                { asset: 'XRP/USD', dir: 'BUY',  originalWR: 38.5, invertedWR: 61.5, n: 52 },
-                { asset: 'XRP/USD', dir: 'SELL', originalWR: 38.1, invertedWR: 61.9, n: 42 },
-                { asset: 'SOL/USD', dir: 'BUY',  originalWR: 36.4, invertedWR: 63.6, n: 22 }
-            ];
-
-            const kamikaze = KAMIKAZE_COMBOS.find(k => k.asset === s.assetId && k.dir === s.analysis.direction);
-            if (kamikaze) {
-                const oldDir = s.analysis.direction;
-                s.analysis.direction = oldDir === 'BUY' ? 'SELL' : 'BUY';
-                s.analysis.edge *= -1;
-                s.isInverted = true;
-                console.log(`[V16-INVERT] ${s.assetId} ${s.tf} invertida: ${oldDir}→${s.analysis.direction} (WR original: ${kamikaze.originalWR}%, invertido: ${kamikaze.invertedWR}%)`);
-            }
-
             // ═══════════════════════════════════════════════════════
 
             // Trade levels: usar contexto IA si disponible, sino default
