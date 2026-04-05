@@ -998,21 +998,10 @@ async function safeSend(text) {
 // ═══════════════════════════════════════════════════════════════════
 // MÓDULO 7: IA AUTOMÁTICA (Gemini — se ejecuta al generar señal)
 // ═══════════════════════════════════════════════════════════════════
-
 async function executeIAAnalysis(s, modeString) {
-    // MOCK TEMPORAL PARA AHORRAR API QUOTA DURANTE TESTS
-    // iaScore=65 para NO disparar V16-TRAP (bloquea si score>70 + cwev<3)
-    console.log('[IA_MOCK] Simulando respuesta de IA para no gastar API.');
-    return {
-        iaScore: 65,
-        iaContext: 'CONTINUATION',
-        iaReasoning: 'MOCK: IA desactivada temporalmente por pruebas de broker.',
-        iaVerdict: 'EXECUTE',
-        isExecute: true
-    };
-
     // ═══ CÓDIGO ORIGINAL DE IA (preservado para reactivar) ═══
     if (!s || !s.analysis) return null;
+
 
     const assetContext = getAssetLearningContext(s.assetId);
     const dualScore = s.dualScore || 0;
@@ -1589,6 +1578,27 @@ async function globalScan(scanType = 'auto') {
                     continue;
                 }
             }
+            // ═══════════════════════════════════════════════════════
+            // V17: FILTRO FRANCOTIRADOR (GOLDEN COMBOS PARA REAL)
+            // ═══════════════════════════════════════════════════════
+            const cwev = s.analysis.cwev;
+            const lobAligned = (s.analysis.direction === 'BUY' && s.obi > 0) || (s.analysis.direction === 'SELL' && s.obi < 0);
+            
+            let isGolden = false;
+            if (s.assetId === 'SOL/USD' && s.analysis.direction === 'BUY' && cwev >= 7) isGolden = true; // WR: 78.6%
+            if (s.assetId === 'XRP/USD' && s.analysis.direction === 'BUY' && cwev < 0) isGolden = true;  // WR: 76.5%
+            if (s.assetId === 'BTC/USD' && s.analysis.direction === 'BUY' && lobAligned) isGolden = true; // WR: 69.8%
+            if (s.assetId === 'BTC/USD' && s.analysis.direction === 'SELL' && cwev < 0) isGolden = true; // WR: 66.7%
+            if (s.assetId === 'ADA/USD' && s.analysis.direction === 'SELL' && cwev >= 7 && !lobAligned) isGolden = true; // WR: 66.7%
+
+            if (!isGolden) {
+                console.log(`[V17-FRANCOTIRADOR] ${s.assetId} ${s.tf} ${s.analysis.direction} ignorada. No es un Golden Combo.`);
+                continue; // Salta a la siguiente señal sin gastar IA ni operar
+            }
+
+            // Preparar datos para IA antes de enviar mensaje
+            s.modeString = modeString;
+            s.dualScore = dualScore;
 
             // Preparar datos para IA antes de enviar mensaje
             s.modeString = modeString;
