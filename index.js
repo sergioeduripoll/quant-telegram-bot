@@ -1194,7 +1194,7 @@ console.log(`🤖 Quant Sniper V15 SUPABASE iniciando...`);
         console.error('[BOOT]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
     }
 
-    bot.sendMessage(chatId, '🟢 *Quant Sniper V15 SUPABASE* encendido.\n🧠 RL persistente + Supabase + IA on-demand\n📊 /profile /stats /scan /analyze', { parse_mode: 'Markdown' });
+    bot.sendMessage(chatId, '🟢 *Quant Sniper V18 REAL* encendido.\n🧠 RL persistente + Supabase + IA on-demand\n🎯 Golden Combos actualizados (1326 trades)\n📊 /profile /stats /scan /analyze /broker', { parse_mode: 'Markdown' });
 })();
 
 
@@ -1214,11 +1214,12 @@ async function globalScan(scanType = 'auto') {
     // ── Inicio de lógica de scan (intacta) ──
     const currentServerTime = getSyncedTime();
 
-    // DISABLED: Circuit Breaker desactivado durante fase de recolección de datos
-    // if (currentServerTime < globalPauseUntil) {
-    //     console.log(`[PAUSA] Bot en reposo hasta ${new Date(globalPauseUntil).toLocaleTimeString('es-AR')}`);
-    //     return;
-    // }
+    // CIRCUIT BREAKER: Respetar pausa anti-ruina
+    if (currentServerTime < globalPauseUntil) {
+        console.log(`[PAUSA] Bot en reposo hasta ${new Date(globalPauseUntil).toLocaleTimeString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' })}`);
+        isScanning = false;
+        return;
+    }
 
     const startTime = getLocalTime();
     console.log(`[${startTime}] 🚀 Scan ADAPTIVE...`);
@@ -1267,23 +1268,24 @@ async function globalScan(scanType = 'auto') {
                 }
             });
 
-            // DISABLED: Circuit Breaker desactivado durante fase de recolección de datos
-            // const totalFinishedTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').length;
-            // const globalLastTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').slice(-4);
-            //
-            // if (globalLastTrades.length > 0 && globalLastTrades[globalLastTrades.length - 1].Veredicto === 'GANADA') {
-            //     circuitBreakerLevel = 0;
-            // }
-            //
-            // if (globalLastTrades.length === 4 && globalLastTrades.every(r => r.Veredicto === 'PERDIDA') && totalFinishedTrades > lastCircuitBreakerTradeCount) {
-            //     lastCircuitBreakerTradeCount = totalFinishedTrades;
-            //     const cooldownMinutes = 30 * Math.pow(2, Math.min(circuitBreakerLevel, 2));
-            //     globalPauseUntil = currentServerTime + (cooldownMinutes * 60 * 1000);
-            //     circuitBreakerLevel++;
-            //
-            //     bot.sendMessage(chatId, `🚨 *CIRCUIT BREAKER Nivel ${circuitBreakerLevel}*\n4 pérdidas consecutivas → Pausa ${cooldownMinutes}min`, { parse_mode: 'Markdown' });
-            //     return;
-            // }
+            // CIRCUIT BREAKER: Protección anti-ruina activada para cuenta REAL
+            const totalFinishedTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').length;
+            const globalLastTrades = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA').slice(-4);
+
+            if (globalLastTrades.length > 0 && globalLastTrades[globalLastTrades.length - 1].Veredicto === 'GANADA') {
+                circuitBreakerLevel = 0;
+            }
+
+            if (globalLastTrades.length === 4 && globalLastTrades.every(r => r.Veredicto === 'PERDIDA') && totalFinishedTrades > lastCircuitBreakerTradeCount) {
+                lastCircuitBreakerTradeCount = totalFinishedTrades;
+                const cooldownMinutes = 30 * Math.pow(2, Math.min(circuitBreakerLevel, 2));
+                globalPauseUntil = currentServerTime + (cooldownMinutes * 60 * 1000);
+                circuitBreakerLevel++;
+
+                bot.sendMessage(chatId, `🚨 *CIRCUIT BREAKER Nivel ${circuitBreakerLevel}*\n4 pérdidas consecutivas → Pausa ${cooldownMinutes}min`, { parse_mode: 'Markdown' });
+                isScanning = false;
+                return;
+            }
         }
     } catch (e) {
         console.error('[SCAN_DB_LOAD]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
@@ -1604,22 +1606,50 @@ async function globalScan(scanType = 'auto') {
                 }
             }
             // ═══════════════════════════════════════════════════════
-            // V17: FILTRO FRANCOTIRADOR (GOLDEN COMBOS PARA REAL)
+            // V18: FILTRO FRANCOTIRADOR (GOLDEN COMBOS — datos de 1326 trades)
+            // Actualizado: Solo combos con WR >= 65% y min 10 trades
             // ═══════════════════════════════════════════════════════
             const cwev = s.analysis.cwev;
+            const stab = s.analysis.stability * 100;
             const lobAligned = (s.analysis.direction === 'BUY' && s.obi > 0) || (s.analysis.direction === 'SELL' && s.obi < 0);
             
             let isGolden = false;
-            if (s.assetId === 'SOL/USD' && s.analysis.direction === 'BUY' && cwev >= 7) isGolden = true; // WR: 78.6%
-            if (s.assetId === 'XRP/USD' && s.analysis.direction === 'BUY' && cwev < 0) isGolden = true;  // WR: 76.5%
-            if (s.assetId === 'BTC/USD' && s.analysis.direction === 'BUY' && lobAligned) isGolden = true; // WR: 69.8%
-            if (s.assetId === 'BTC/USD' && s.analysis.direction === 'SELL' && cwev < 0) isGolden = true; // WR: 66.7%
-            if (s.assetId === 'ADA/USD' && s.analysis.direction === 'SELL' && cwev >= 7 && !lobAligned) isGolden = true; // WR: 66.7%
+            let goldenTag = '';
+
+            // ── TIER 1: WR >= 75% (quirúrgicos) ──
+            if (s.assetId === 'SOL/USD' && s.analysis.direction === 'BUY' && cwev >= 7 && !lobAligned && stab >= 70) { isGolden = true; goldenTag = 'SOL-BUY-hiCWEV-hiStab (90.5%)'; }
+            if (s.assetId === 'SOL/USD' && s.analysis.direction === 'BUY' && cwev >= 7 && !lobAligned) { isGolden = true; goldenTag = goldenTag || 'SOL-BUY-hiCWEV-lobBAD (83.3%)'; }
+            if (s.assetId === 'XRP/USD' && s.analysis.direction === 'SELL' && cwev >= 7 && !lobAligned && stab >= 70) { isGolden = true; goldenTag = goldenTag || 'XRP-SELL-hiCWEV-hiStab (76.9%)'; }
+
+            // ── TIER 2: WR >= 67% (sólidos) ──
+            if (s.assetId === 'BTC/USD' && s.analysis.direction === 'BUY' && cwev < 0 && lobAligned && stab < 70) { isGolden = true; goldenTag = goldenTag || 'BTC-BUY-negCWEV-lobOK-loStab (71.4%)'; }
+            if (s.assetId === 'ADA/USD' && s.analysis.direction === 'SELL' && cwev >= 7 && !lobAligned) { isGolden = true; goldenTag = goldenTag || 'ADA-SELL-hiCWEV-lobBAD (68.2%)'; }
+            if (s.assetId === 'XRP/USD' && s.analysis.direction === 'SELL' && cwev >= 7 && !lobAligned) { isGolden = true; goldenTag = goldenTag || 'XRP-SELL-hiCWEV-lobBAD (70.6%)'; }
+            if (s.assetId === 'BTC/USD' && s.analysis.direction === 'BUY' && cwev >= 7 && lobAligned) { isGolden = true; goldenTag = goldenTag || 'BTC-BUY-hiCWEV-lobOK (67.5%)'; }
+            if (s.assetId === 'XRP/USD' && s.analysis.direction === 'SELL' && cwev >= 0 && cwev < 7 && lobAligned) { isGolden = true; goldenTag = goldenTag || 'XRP-SELL-loCWEV-lobOK (70.0%)'; }
+            if (s.assetId === 'XRP/USD' && s.analysis.direction === 'BUY' && cwev >= 0 && cwev < 7 && lobAligned) { isGolden = true; goldenTag = goldenTag || 'XRP-BUY-loCWEV-lobOK (69.2%)'; }
+
+            // ── BLACKLIST: Combos tóxicos (WR < 35%) — BLOQUEO TOTAL ──
+            let isBlacklisted = false;
+            if (s.assetId === 'DOGE/USD' && s.analysis.direction === 'BUY' && cwev >= 3 && cwev < 7 && lobAligned) isBlacklisted = true;  // 17.6% WR
+            if (s.assetId === 'ETH/USD' && s.analysis.direction === 'BUY' && cwev >= 7 && !lobAligned) isBlacklisted = true;               // 28.6% WR
+            if (s.assetId === 'ADA/USD' && s.analysis.direction === 'BUY' && cwev >= 7 && lobAligned) isBlacklisted = true;                // 30.8% WR
+            if (s.assetId === 'BTC/USD' && s.analysis.direction === 'BUY' && cwev >= 0 && cwev < 7 && !lobAligned) isBlacklisted = true;   // 28.6% WR
+            if (s.assetId === 'BTC/USD' && s.analysis.direction === 'SELL' && cwev >= 0 && cwev < 7 && !lobAligned) isBlacklisted = true;  // 31.2% WR
+            if (s.assetId === 'ETH/USD' && s.analysis.direction === 'SELL' && cwev >= 3 && cwev < 7 && !lobAligned) isBlacklisted = true;  // 27.3% WR
+            if (s.assetId === 'BNB/USD' && s.analysis.direction === 'BUY' && cwev >= 7 && lobAligned) isBlacklisted = true;                // 36.8% WR
+
+            if (isBlacklisted) {
+                console.log(`[V18-BLACKLIST] ${s.assetId} ${s.tf} ${s.analysis.direction} BLOQUEADA: combo tóxico.`);
+                continue;
+            }
 
             if (!isGolden) {
-                console.log(`[V17-FRANCOTIRADOR] ${s.assetId} ${s.tf} ${s.analysis.direction} ignorada. No es un Golden Combo.`);
-                continue; // Salta a la siguiente señal sin gastar IA ni operar
+                console.log(`[V18-FRANCOTIRADOR] ${s.assetId} ${s.tf} ${s.analysis.direction} cwev=${cwev.toFixed(1)} lob=${lobAligned ? 'OK' : 'BAD'} stab=${stab.toFixed(0)} — No es Golden Combo.`);
+                continue;
             }
+
+            console.log(`[V18-GOLDEN] ✅ ${s.assetId} ${s.tf} ${s.analysis.direction} → ${goldenTag}`);
 
             // Preparar datos para IA antes de enviar mensaje
             s.modeString = modeString;
@@ -1657,6 +1687,7 @@ async function globalScan(scanType = 'auto') {
             const invertTag = s.isInverted ? '🔄 *INVERTIDA POR ESTADÍSTICA*\n\n' : '';
             const dirIcon = s.analysis.direction === 'BUY' ? '🟢' : '🔴';
             let msgText = `${invertTag}🎯 *${s.assetId} | ${s.tf}*\n\n`;
+            msgText += `🏅 *Golden:* ${goldenTag}\n`;
             msgText += `MODO: E:${eliteCheck} → A:${agrCheck}\n`;
             msgText += `🏆 ${scoreVisual}\n\n`;
             msgText += `${dirIcon} *${s.analysis.direction}*\n`;
@@ -1698,6 +1729,8 @@ async function globalScan(scanType = 'auto') {
             // ═══════════════════════════════════════════════════════
             // GATILLO: Disparar orden al bridge ExpertOption (Render)
             // ═══════════════════════════════════════════════════════
+            let brokerTradeId = null;
+            let brokerMode = null;
             try {
                 const bridgeUrl = process.env.BRIDGE_URL || 'http://127.0.0.1:5000';
                 const bridgeSecret = process.env.BRIDGE_SECRET || '';
@@ -1709,7 +1742,7 @@ async function globalScan(scanType = 'auto') {
                     console.log(`[BRIDGE_SEND] ⏳ Render despertando...`);
                 }
 
-                console.log(`[BRIDGE_SEND] =====> Enviando ${s.assetId} ${s.analysis.direction} ${s.tf} a ${bridgeUrl}/trade`);
+                console.log(`[BRIDGE_SEND] =====> Enviando ${s.assetId} ${s.analysis.direction} ${s.tf} [${goldenTag}] a ${bridgeUrl}/trade`);
                 
                 let bridgeRes;
                 for (let attempt = 0; attempt < 2; attempt++) {
@@ -1718,20 +1751,34 @@ async function globalScan(scanType = 'auto') {
                             asset: s.assetId,
                             direction: s.analysis.direction,
                             tf: s.tf
+                            // amount se configura en el bridge con TRADE_AMOUNT env var
                         }, {
                             timeout: 60000,
                             headers: bridgeSecret ? { 'Authorization': `Bearer ${bridgeSecret}` } : {}
                         });
-                        console.log(`[BRIDGE_SEND] ✅ Respuesta: ${JSON.stringify(bridgeRes.data)}`);
+                        const rd = bridgeRes.data;
+                        console.log(`[BRIDGE_SEND] ✅ Respuesta: ${JSON.stringify(rd)}`);
+                        
+                        // Capturar trade_id y modo del broker
+                        if (rd.trade_id) brokerTradeId = rd.trade_id;
+                        if (rd.mode) brokerMode = rd.mode;
+                        
+                        // Notificar resultado al Telegram
+                        const modeIcon = rd.mode === 'REAL' ? '💵' : '🧪';
+                        const confirmMsg = `${modeIcon} *Orden ejecutada* | ${rd.mode || '?'} | $${rd.amount || '?'}\n🎫 ID: \`${rd.trade_id || 'N/A'}\`${rd.open_rate ? `\n📊 Open: ${rd.open_rate}` : ''}`;
+                        await safeSend(confirmMsg);
                         break;
                     } catch (err) {
-                        if (attempt === 1) throw err;
+                        if (attempt === 1) {
+                            throw err;
+                        }
                         console.log('[BRIDGE_RETRY] Reintentando envío a Render...');
                         await new Promise(r => setTimeout(r, 2000));
                     }
                 }
             } catch (tradeErr) {
                 console.error(`[BRIDGE_SEND] ❌ Error final: ${tradeErr.message}`);
+                await safeSend(`⚠️ Error ejecutando orden: ${tradeErr.message}`);
             }
 
             // DB: Insertar señal con IA incluida, veredicto siempre PENDIENTE
@@ -1952,13 +1999,13 @@ bot.onText(/\/broker/, async (msg) => {
             });
             const d = res.data;
             if (d.connected) {
-                const balanceText = d.balance !== null ? `$${d.balance}` : 'N/A (ver logs Render)';
-                let text = `Broker: CONECTADO\nCuenta: ${d.mode}\nSaldo: ${balanceText}`;
-                // Mostrar métodos disponibles si hay debug
-                if (d.debug && d.debug.available_methods) {
-                    const methods = d.debug.available_methods.substring(0, 200);
-                    text += `\n\nMetodos API: ${methods}`;
-                }
+                const modeIcon = d.mode === 'REAL' ? '💵' : '🧪';
+                let text = `${modeIcon} *Broker: CONECTADO*\n`;
+                text += `Modo: *${d.mode}*\n`;
+                text += `Monto por trade: *$${d.trade_amount || '?'}*\n\n`;
+                text += `💰 Saldo activo: $${d.balance !== null ? d.balance.toFixed(2) : 'N/A'}\n`;
+                text += `🧪 Demo: $${d.demo_balance !== null ? d.demo_balance.toFixed(2) : 'N/A'}\n`;
+                text += `💵 Real: $${d.real_balance !== null ? d.real_balance.toFixed(2) : 'N/A'}`;
                 await safeSend(text);
             } else {
                 await safeSend(`Broker: DESCONECTADO\n${d.message || 'Sin conexion activa'}`);
