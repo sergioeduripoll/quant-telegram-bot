@@ -72,13 +72,25 @@ const DEFAULT_ZONES = {
 let CURRENT_WINNING_ZONES = JSON.parse(JSON.stringify(DEFAULT_ZONES));
 const SIGNAL_CACHE = new Map();
 // signalCounter eliminado — usamos timestamp único para evitar colisiones en redeploy
+
 const PENDING_AUDITS = [];
+const MAX_AUDITS = 200;
 
 // Control Anti-Ruina Progresivo y Cache Global
 let globalPauseUntil = 0;
 let circuitBreakerLevel = 0;
 let lastCircuitBreakerTradeCount = 0;
+
 const GLOBAL_CANDLE_CACHE = new Map();
+const MAX_CANDLE_CACHE = 50;
+
+function setCandleCache(key, value) {
+    if (GLOBAL_CANDLE_CACHE.size >= MAX_CANDLE_CACHE) {
+        const firstKey = GLOBAL_CANDLE_CACHE.keys().next().value;
+        GLOBAL_CANDLE_CACHE.delete(firstKey);
+    }
+    GLOBAL_CANDLE_CACHE.set(key, value);
+}
 
 // ── Memoria Dinámica Adaptativa (3 capas) ──
 const LOSS_STREAKS = {};                                // Capa 1: racha actual por activo
@@ -999,9 +1011,7 @@ async function safeSend(text) {
 // MÓDULO 7: IA AUTOMÁTICA (Gemini — se ejecuta al generar señal)
 // ═══════════════════════════════════════════════════════════════════
 async function executeIAAnalysis(s, modeString) {
-    // ═══ CÓDIGO ORIGINAL DE IA (preservado para reactivar) ═══
     if (!s || !s.analysis) return null;
-
 
     const assetContext = getAssetLearningContext(s.assetId);
     const dualScore = s.dualScore || 0;
@@ -1031,11 +1041,17 @@ TRADE_CONTEXT: (CONTINUATION, REVERSAL, o TRAP)
 REASONING: (2 oraciones).`;
 
     try {
+        if (!process.env.GEMINI_API_KEY) {
+            console.error('[IA_GEMINI] API KEY no definida');
+            return null;
+        }
         const apiKey = process.env.GEMINI_API_KEY;
         const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
         const result = await axios.post(url, {
             contents: [{ parts: [{ text: promptText }] }],
             generationConfig: { temperature: 0.2 }
+        }, {
+            timeout: 10000
         });
 
         const candidates = result?.data?.candidates;
@@ -1277,6 +1293,14 @@ async function globalScan(scanType = 'auto') {
     CURRENT_WINNING_ZONES = buildWinningZonesFromCSV(parsedData);
     // DB: resolvedRows ya vienen con _win, _cwev, etc. precalculados desde db.getRecentTrades
     const resolvedRows = parsedData.filter(r => r.Veredicto === 'GANADA' || r.Veredicto === 'PERDIDA');
+
+    // INDEXACIÓN POR ACTIVO (optimización O(1))
+    const rowsByAsset = {};
+    for (const r of resolvedRows) {
+        if (!rowsByAsset[r.Activo]) rowsByAsset[r.Activo] = [];
+        rowsByAsset[r.Activo].push(r);
+    }
+
     ADAPTIVE_PROFILES = buildAdaptiveProfiles(resolvedRows);
     updateMemoryFromCSV(resolvedRows);
     // INTEGRATION 6.5: Aprendizaje adaptativo evolutivo
@@ -1316,7 +1340,7 @@ async function globalScan(scanType = 'auto') {
 
             // Helper: mapear klines de Binance a formato {o, h, l, c}
             const mapKlines = (data) => data.map(v => ({
-                o: parseFloat(v[1]), h: parseFloat(v[2]), l: parseFloat(v[3]), c: parseFloat(v[4])
+                o: parseFloat(v[1]) || 0, h: parseFloat(v[2]) || 0, l: parseFloat(v[3]) || 0, c: parseFloat(v[4]) || 0
             }));
 
             /**
@@ -1348,7 +1372,7 @@ async function globalScan(scanType = 'auto') {
                 historical = await fetchFullHistory(asset.symbolBinance, 5);
                 if (!historical || historical.length < 100) continue;
                 console.log(`[DATA] ${asset.id}: ${historical.length} velas cargadas desde Binance`);
-                GLOBAL_CANDLE_CACHE.set(asset.id, historical);
+                setCandleCache(asset.id, historical);
             } else {
                 // Con cache: pedir últimas 100 velas y mergear
                 const recentRes = await axios.get(`${CONFIG.BINANCE_API}/klines?symbol=${asset.symbolBinance}&interval=5m&limit=100`);
@@ -1374,7 +1398,7 @@ async function globalScan(scanType = 'auto') {
                     }
 
                     if (historical.length > 6000) historical = historical.slice(historical.length - 6000);
-                    GLOBAL_CANDLE_CACHE.set(asset.id, historical);
+                    setCandleCache(asset.id, historical);
                 }
             }
 
@@ -1384,8 +1408,8 @@ async function globalScan(scanType = 'auto') {
                 axios.get(`${CONFIG.BINANCE_API}/klines?symbol=${asset.symbolBinance}&interval=1h&limit=50`),
                 axios.get(`${CONFIG.BINANCE_API}/klines?symbol=${asset.symbolBinance}&interval=4h&limit=50`)
             ]);
-            const s1h = detectStructure(mRes1h.data.map(v=>({h:parseFloat(v[2]),l:parseFloat(v[3])})));
-            const s4h = detectStructure(mRes4h.data.map(v=>({h:parseFloat(v[2]),l:parseFloat(v[3])})));
+            const s1h = detectStructure(mRes1h.data.map(v=>({h:parseFloat(v[2]) || 0,l:parseFloat(v[3]) || 0})));
+            const s4h = detectStructure(mRes4h.data.map(v=>({h:parseFloat(v[2]) || 0,l:parseFloat(v[3]) || 0})));
 
             let obi = 0;
             try {
@@ -1393,19 +1417,19 @@ async function globalScan(scanType = 'auto') {
                 let bV=0, aV=0;
 
                 if(lobRes.data.bids && lobRes.data.asks && lobRes.data.bids.length > 0 && lobRes.data.asks.length > 0) {
-                    const bestBid = parseFloat(lobRes.data.bids[0][0]);
-                    const bestAsk = parseFloat(lobRes.data.asks[0][0]);
+                    const bestBid = parseFloat(lobRes.data.bids[0][0]) || 0;
+                    const bestAsk = parseFloat(lobRes.data.asks[0][0]) || 0;
                     const midPrice = (bestBid + bestAsk) / 2;
 
                     lobRes.data.bids.forEach(l => {
-                        const price = parseFloat(l[0]);
-                        const vol = parseFloat(l[1]);
+                        const price = parseFloat(l[0]) || 0;
+                        const vol = parseFloat(l[1]) || 0;
                         const distance = Math.max(Math.abs(midPrice - price) / midPrice, 0.0001);
                         bV += vol * (1 / distance);
                     });
                     lobRes.data.asks.forEach(l => {
-                        const price = parseFloat(l[0]);
-                        const vol = parseFloat(l[1]);
+                        const price = parseFloat(l[0]) || 0;
+                        const vol = parseFloat(l[1]) || 0;
                         const distance = Math.max(Math.abs(midPrice - price) / midPrice, 0.0001);
                         aV += vol * (1 / distance);
                     });
@@ -1441,7 +1465,7 @@ async function globalScan(scanType = 'auto') {
         if (historicalForAsset && historicalForAsset.length >= 10) {
             const recent10 = historicalForAsset.slice(-10).map(c => c.c);
             let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
-            for (let k = 0; k < 10; k++) { sumX += k; sumY += recent10[k]; sumXY += k * recent10[k]; sumX2 += k * k; }
+            for (let k = 0; k < recent10.length; k++) { sumX += k; sumY += recent10[k]; sumXY += k * recent10[k]; sumX2 += k * k; }
             momentumSlope = (10 * sumXY - sumX * sumY) / (10 * sumX2 - sumX * sumX);
         }
 
@@ -1462,7 +1486,8 @@ async function globalScan(scanType = 'auto') {
         s.nearSupport = nearSupport;
         s.passMacro = passMacro;
 
-        const lastTradesAsset = parsedData.filter(r => r.Activo === s.assetId).slice(-5);
+        const assetRows = rowsByAsset[s.assetId] || [];
+        const lastTradesAsset = assetRows.slice(-5);
         const recentLossesAsset = lastTradesAsset.filter(r => r.Veredicto === 'PERDIDA').length;
 
         // --- EVALUACIÓN ELITE ---
@@ -1599,10 +1624,6 @@ async function globalScan(scanType = 'auto') {
             // Preparar datos para IA antes de enviar mensaje
             s.modeString = modeString;
             s.dualScore = dualScore;
-
-            // Preparar datos para IA antes de enviar mensaje
-            s.modeString = modeString;
-            s.dualScore = dualScore;
             s._adaptiveAdj = adaptiveResult;
 
             // IA AUTOMÁTICA: ejecutar Gemini para esta señal
@@ -1614,7 +1635,7 @@ async function globalScan(scanType = 'auto') {
 
             // A. BLOQUEADOR TRAMPA IA: ia_score>70 + cwev<3 = 30% WR (23 trades)
             //    ia_score>75 + cwev<4 = 11% WR (9 trades) — casi pérdida garantizada
-            if (iaResult && iaResult.iaScore > 70 && s.analysis.cwev < 3.0) {
+            if (iaResult && typeof iaResult.iaScore === 'number' && iaResult.iaScore > 70 && s.analysis.cwev < 3.0) {
                 console.log(`[V16-TRAP] ${s.assetId} ${s.tf} BLOQUEADA: Trampa IA (score=${iaResult.iaScore}, cwev=${s.analysis.cwev.toFixed(1)}) — WR histórico <30%`);
                 continue;
             }
@@ -1689,17 +1710,28 @@ async function globalScan(scanType = 'auto') {
                 }
 
                 console.log(`[BRIDGE_SEND] =====> Enviando ${s.assetId} ${s.analysis.direction} ${s.tf} a ${bridgeUrl}/trade`);
-                const bridgeRes = await axios.post(`${bridgeUrl}/trade`, {
-                    asset: s.assetId,
-                    direction: s.analysis.direction,
-                    tf: s.tf
-                }, {
-                    timeout: 60000,
-                    headers: bridgeSecret ? { 'Authorization': `Bearer ${bridgeSecret}` } : {}
-                });
-                console.log(`[BRIDGE_SEND] ✅ Respuesta: ${JSON.stringify(bridgeRes.data)}`);
+                
+                let bridgeRes;
+                for (let attempt = 0; attempt < 2; attempt++) {
+                    try {
+                        bridgeRes = await axios.post(`${bridgeUrl}/trade`, {
+                            asset: s.assetId,
+                            direction: s.analysis.direction,
+                            tf: s.tf
+                        }, {
+                            timeout: 60000,
+                            headers: bridgeSecret ? { 'Authorization': `Bearer ${bridgeSecret}` } : {}
+                        });
+                        console.log(`[BRIDGE_SEND] ✅ Respuesta: ${JSON.stringify(bridgeRes.data)}`);
+                        break;
+                    } catch (err) {
+                        if (attempt === 1) throw err;
+                        console.log('[BRIDGE_RETRY] Reintentando envío a Render...');
+                        await new Promise(r => setTimeout(r, 2000));
+                    }
+                }
             } catch (tradeErr) {
-                console.error(`[BRIDGE_SEND] ❌ Error: ${tradeErr.message}`);
+                console.error(`[BRIDGE_SEND] ❌ Error final: ${tradeErr.message}`);
             }
 
             // DB: Insertar señal con IA incluida, veredicto siempre PENDIENTE
@@ -1717,6 +1749,9 @@ async function globalScan(scanType = 'auto') {
             });
 
             // Auditoría pendiente
+            if (PENDING_AUDITS.length >= MAX_AUDITS) {
+                PENDING_AUDITS.shift();
+            }
             PENDING_AUDITS.push({
                 sigId, assetId: s.assetId, symbolBinance: s.symbolBinance, tf: s.tf,
                 direction: s.analysis.direction,
