@@ -1016,75 +1016,105 @@ async function executeIAAnalysis(s, modeString) {
     const assetContext = getAssetLearningContext(s.assetId);
     const dualScore = s.dualScore || 0;
 
-    const promptText = `Eres un Quant Trader Institucional. Decide el SCORE de ejecución y CLASIFICA el contexto.
-MODO: ${modeString} (Dual Score: ${dualScore.toFixed(1)}).
+    const promptText = `Sos un trader profesional de opciones binarias que vive de esto. Tu trabajo es decidir si esta señal merece arriesgar dinero real. Sé estricto — solo EXECUTE si estás convencido.
 
 SEÑAL:
-Activo: ${s.assetId} | TF: ${s.tf} | Dir: ${s.analysis.direction} | Prob: ${s.analysis.prob.toFixed(1)}% | Edge: ${s.analysis.edge.toFixed(2)}%
-Stability: ${(s.analysis.stability * 100).toFixed(0)}% | LOB: ${s.obi.toFixed(3)} | Momentum: ${s.momentumSlope.toFixed(4)} | Macro 4H: ${s.macro.h4}
+Activo: ${s.assetId} | TF: ${s.tf} | Dir: ${s.analysis.direction}
+Prob: ${s.analysis.prob.toFixed(1)}% | Edge: ${s.analysis.edge.toFixed(2)}% | CWEV: ${s.analysis.cwev.toFixed(1)}
+Stability: ${(s.analysis.stability * 100).toFixed(0)}% | LOB: ${s.obi.toFixed(3)} | Momentum: ${s.momentumSlope.toFixed(4)}
+Macro 4H: ${s.macro.h4} | Modo: ${modeString} (Score: ${dualScore.toFixed(1)})
 
-HISTORIAL APRENDIDO:
+HISTORIAL:
 ${assetContext}
 
-FILTRO ADAPTATIVO: Score ${s.adaptiveScore || 'N/A'}/100. ${s.adaptiveReason || ''}
+FILTRO: Score ${s.adaptiveScore || 'N/A'}/100. ${s.adaptiveReason || ''}
 
-REGLAS:
-1. TRADE_CONTEXT:
-   - CONTINUATION: Momentum y Macro a favor.
-   - REVERSAL: Contra Macro pero Momentum fuerte a favor.
-   - TRAP: Divergencia peligrosa.
-2. AI_SCORE (0-100): >65 = EXECUTE. Penaliza si el historial muestra patrones de pérdida similares.
+Responde EXACTAMENTE en este formato (nada más):
+AI_SCORE: (0-100, >65 = EXECUTE)
+TRADE_CONTEXT: (CONTINUATION o REVERSAL o TRAP)
+REASONING: (1-2 oraciones)`;
 
-Responde SOLO:
-AI_SCORE: (0-100)
-TRADE_CONTEXT: (CONTINUATION, REVERSAL, o TRAP)
-REASONING: (2 oraciones).`;
+    // Intentar Claude primero, Gemini como fallback
+    const iaResult = await _callClaude(promptText) || await _callGemini(promptText);
+    return iaResult;
+}
 
+async function _callClaude(prompt) {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return null;
+    
     try {
-        if (!process.env.GEMINI_API_KEY) {
-            console.error('[IA_GEMINI] API KEY no definida');
-            return null;
-        }
-        const apiKey = process.env.GEMINI_API_KEY;
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
-        const result = await axios.post(url, {
-            contents: [{ parts: [{ text: promptText }] }],
-            generationConfig: { temperature: 0.2 }
+        const result = await axios.post('https://api.anthropic.com/v1/messages', {
+            model: 'claude-sonnet-4-20250514',
+            max_tokens: 150,
+            messages: [{ role: 'user', content: prompt }]
         }, {
-            timeout: 10000
+            timeout: 12000,
+            headers: {
+                'x-api-key': apiKey,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json'
+            }
         });
 
-        const candidates = result?.data?.candidates;
-        if (!candidates || !candidates[0]?.content?.parts?.[0]?.text) {
-            console.error('[IA_PARSE]', { message: 'Respuesta vacía de Gemini', time: new Date().toISOString() });
+        const text = result?.data?.content?.[0]?.text;
+        if (!text) {
+            console.error('[IA_CLAUDE] Respuesta vacía');
             return null;
         }
-        const text = candidates[0].content.parts[0].text;
 
-        const scoreMatch = text.match(/AI_SCORE:\s*(\d+)/i);
-        const iaScore = scoreMatch ? Math.min(100, Math.max(0, parseInt(scoreMatch[1]))) : 0;
-
-        const contextMatch = text.match(/TRADE_CONTEXT:\s*(CONTINUATION|REVERSAL|TRAP)/i);
-        const iaContextText = contextMatch ? contextMatch[1].toUpperCase() : 'UNKNOWN';
-
-        const reasonMatch = text.match(/REASONING:\s*([\s\S]*?)$/i);
-        const iaReasoning = reasonMatch ? reasonMatch[1].trim().replace(/[*_[\]]/g, '').substring(0, 500) : 'Análisis completado.';
-
-        if (!scoreMatch) {
-            console.error('[IA_PARSE]', { message: 'No se pudo extraer AI_SCORE', rawText: text.substring(0, 200), time: new Date().toISOString() });
-        }
-
-        return {
-            iaScore,
-            iaContext: iaContextText,
-            iaReasoning,
-            iaVerdict: iaScore >= 65 ? 'EXECUTE' : 'PASS',
-            isExecute: iaScore >= 65
-        };
+        return _parseIAResponse(text, 'CLAUDE');
     } catch (e) {
-        console.error('[IA_GEMINI]', { message: e.message, stack: e.stack, time: new Date().toISOString() });
+        console.error('[IA_CLAUDE]', { message: e.message, time: new Date().toISOString() });
         return null;
     }
+}
+
+async function _callGemini(prompt) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) return null;
+    
+    try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
+        const result = await axios.post(url, {
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.2 }
+        }, { timeout: 12000 });
+
+        const text = result?.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) return null;
+
+        return _parseIAResponse(text, 'GEMINI');
+    } catch (e) {
+        console.error('[IA_GEMINI]', { message: e.message, time: new Date().toISOString() });
+        return null;
+    }
+}
+
+function _parseIAResponse(text, source) {
+    const scoreMatch = text.match(/AI_SCORE:\s*(\d+)/i);
+    const iaScore = scoreMatch ? Math.min(100, Math.max(0, parseInt(scoreMatch[1]))) : 0;
+
+    const contextMatch = text.match(/TRADE_CONTEXT:\s*(CONTINUATION|REVERSAL|TRAP)/i);
+    const iaContextText = contextMatch ? contextMatch[1].toUpperCase() : 'UNKNOWN';
+
+    const reasonMatch = text.match(/REASONING:\s*([\s\S]*?)$/i);
+    const iaReasoning = reasonMatch ? reasonMatch[1].trim().replace(/[*_[\]]/g, '').substring(0, 300) : '';
+
+    if (!scoreMatch) {
+        console.error(`[IA_PARSE] No AI_SCORE en respuesta de ${source}: ${text.substring(0, 100)}`);
+        return null;
+    }
+
+    console.log(`[IA_${source}] Score=${iaScore} Context=${iaContextText}`);
+    return {
+        iaScore,
+        iaContext: iaContextText,
+        iaReasoning,
+        iaVerdict: iaScore >= 65 ? 'EXECUTE' : 'PASS',
+        isExecute: iaScore >= 65,
+        iaSource: source
+    };
 }
 
 
@@ -1640,15 +1670,26 @@ async function globalScan(scanType = 'auto') {
             const iaResult = await executeIAAnalysis(s, modeString);
 
             // ═══════════════════════════════════════════════════════
-            // V16: FILTROS ESTADÍSTICOS (basados en 637 trades reales)
+            // IA como ÚLTIMO FILTRO — si no pasa, no se opera
             // ═══════════════════════════════════════════════════════
-
-            // A. BLOQUEADOR TRAMPA IA: ia_score>70 + cwev<3 = 30% WR (23 trades)
-            //    ia_score>75 + cwev<4 = 11% WR (9 trades) — casi pérdida garantizada
-            if (iaResult && typeof iaResult.iaScore === 'number' && iaResult.iaScore > 70 && s.analysis.cwev < 3.0) {
-                console.log(`[V16-TRAP] ${s.assetId} ${s.tf} BLOQUEADA: Trampa IA (score=${iaResult.iaScore}, cwev=${s.analysis.cwev.toFixed(1)}) — WR histórico <30%`);
+            if (!iaResult) {
+                console.log(`[IA] ${s.assetId} ${s.tf} — IA no disponible, señal descartada`);
                 continue;
             }
+
+            // BLOQUEADOR TRAMPA: ia_score>70 + cwev<3 = WR <30%
+            if (iaResult.iaScore > 70 && s.analysis.cwev < 3.0) {
+                console.log(`[V16-TRAP] ${s.assetId} BLOQUEADA: score=${iaResult.iaScore} cwev=${s.analysis.cwev.toFixed(1)}`);
+                continue;
+            }
+
+            // IA dice PASS → no operar
+            if (!iaResult.isExecute) {
+                console.log(`[IA] ${s.assetId} ${s.tf} — IA dice PASS (${iaResult.iaScore}/100 via ${iaResult.iaSource || '?'})`);
+                continue;
+            }
+
+            console.log(`[IA] ✅ ${s.assetId} APROBADA por ${iaResult.iaSource || '?'} (${iaResult.iaScore}/100 ${iaResult.iaContext})`);
 
             // ═══════════════════════════════════════════════════════
 
@@ -1674,9 +1715,11 @@ async function globalScan(scanType = 'auto') {
             // Bloque IA
             if (iaResult) {
                 const verdictIcon = iaResult.isExecute ? '🚀 EXECUTE' : '⛔ PASS';
-                msgText += `\n🧠 *IA:* ${verdictIcon} (${iaResult.iaScore}/100)`;
+                const src = iaResult.iaSource || '?';
+                msgText += `\n🧠 *IA (${src}):* ${verdictIcon} (${iaResult.iaScore}/100)`;
+                if (iaResult.iaReasoning) msgText += `\n_${iaResult.iaReasoning.substring(0, 150)}_`;
             } else {
-                msgText += `\n🧠 _IA no disponible_`;
+                msgText += `\n🧠 _IA no disponible — operación cancelada_`;
             }
 
             // Bloque Trading
@@ -1961,7 +2004,11 @@ bot.onText(/\/broker/, async (msg) => {
             const d = res.data;
             if (d.connected) {
                 const mi = d.mode === 'REAL' ? '💵' : '🧪';
-                let text = `${mi} Broker: CONECTADO\nModo: ${d.mode}\nMonto: $${d.trade_amount || '?'}\n\nSaldo activo: $${d.balance !== null && d.balance !== undefined ? Number(d.balance).toFixed(2) : 'N/A'}\nDemo: $${d.demo_balance || 'N/A'}\nReal: $${d.real_balance || 'N/A'}`;
+                const bal = d.balance !== null && d.balance !== undefined ? Number(d.balance).toFixed(2) : 'N/A';
+                let text = `${mi} Broker: CONECTADO\nModo: ${d.mode}\n\nSaldo activo: $${bal}`;
+                if (d.demo_balance) text += `\nDemo: $${d.demo_balance}`;
+                if (d.real_balance) text += `\nReal: $${d.real_balance}`;
+                text += `\n\nOperación: ${d.trade_pct || '?'}% del saldo = $${d.next_amount || '?'}`;
                 await safeSend(text);
             } else {
                 await safeSend(`Broker: DESCONECTADO\n${d.message || 'Sin WS'}`);
