@@ -1045,7 +1045,7 @@ async function _callClaude(prompt) {
     
     try {
         const result = await axios.post('https://api.anthropic.com/v1/messages', {
-            model: 'claude-sonnet-4-20250514',
+            model: 'claude-haiku-4-5-20251001',
             max_tokens: 150,
             messages: [{ role: 'user', content: prompt }]
         }, {
@@ -1065,7 +1065,15 @@ async function _callClaude(prompt) {
 
         return _parseIAResponse(text, 'CLAUDE');
     } catch (e) {
-        console.error('[IA_CLAUDE]', { message: e.message, time: new Date().toISOString() });
+        // Log detallado del error para diagnosticar
+        const status = e.response?.status;
+        const errData = e.response?.data;
+        console.error('[IA_CLAUDE]', { 
+            status, 
+            error_type: errData?.error?.type,
+            error_msg: errData?.error?.message?.substring(0, 200),
+            time: new Date().toISOString() 
+        });
         return null;
     }
 }
